@@ -1,6 +1,6 @@
 # DragonBurn — Changes Since We Started
 
-Detailed log of work done on this codebase in the Aug 11, 2026 session (and the continuation of that work). This is **not** a full project history from before that; it is what changed while hardening, polishing, and extending DragonBurn in Cursor.
+Detailed log of work done on this codebase in the Aug 11, 2026 session (and the continuation of that work). This is **not** a full project history from before that; it is what changed while hardening, polishing, and extending DragonBurn.
 
 For build/run instructions, see [`README.md`](README.md).
 
@@ -317,9 +317,3 @@ To feed RCS / prediction / aimbot:
 3. Kernel backend should find `.sys` / mapper from build folders without manual copy.  
 4. Menu: Combat → Aimbot / Recoil; Misc → World ESP + Grenade Lineups.  
 5. Clean exit should restore tracked host registry prefs (another reboot may be needed for HVCI/blocklist to fully apply).  
-
----
-
-## Note on legality / risk
-
-This project is a CS2 external cheat stack (overlay + optional vulnerable-driver mapper). Changes above improve engineering honesty and the features Jonas asked for; they do **not** make it safe for online competitive play or “undetected.” Use only in environments you accept the risk for.
