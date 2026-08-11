@@ -2,6 +2,8 @@
 
 Windows usermode overlay + optional kernel memory driver for CS2. Three projects; build order matters.
 
+**What we changed in the recent hardening/feature pass:** see [`CHANGES.md`](CHANGES.md).
+
 ## Requirements
 
 - Windows 10/11 x64
