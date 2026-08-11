@@ -168,28 +168,25 @@ Menu X/Y now persist through config instead of being lost.
 
 ---
 
-## 4. Offsets: remote a2x dumps (every launch)
+## 4. Offsets: remote a2x dumps (smart cache)
 
-**Before:** Relied on local / sidecar dump workflow (`cs2-dumper.exe` style), which was fragile and not really in the repo.
+**Before:** Relied on local / sidecar dump workflow (`cs2-dumper.exe` style), which was fragile and not really in the repo. Later briefly pulled from GitHub **every launch** (bad for rate limits while testing).
 
 **After:**
 
-- On **every** launch, download fresh JSON from:
+- Downloads from a2x `output/offsets.json` + `client_dll.json` into `offsets/`
+- **Smart cache** via `offsets/cache_meta.json`:
+  - TTL **6 hours** (`kCacheMaxAgeHours`)
+  - Also refreshes when on-disk **`client.dll` size/mtime** changes (CS2 update)
+  - Also refreshes when live **`dwBuildNumber`** (engine2) differs from last run
+  - Also refreshes if functional validation fails / cache corrupt
+  - Otherwise reuses local JSON (safe for rapid relaunch testing)
+- Temp download + rename; basic JSON sanity checks
+- Linked `urlmon.lib` / `wininet.lib`
 
-  - `https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json`
-  - `https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json`
+**Force refresh:** delete `offsets/cache_meta.json` or the cached JSON files.
 
-- Written under `offsets/` next to the usermode exe (temp file + rename; basic JSON sanity checks)  
-- `DeleteUrlCacheEntry` + overwrite so WinINet cache doesn’t stick you on stale dumps  
-- **Local cache is fallback only** if GitHub is unreachable  
-- Functional test still validates live game reads; can re-fetch once if offsets look wrong  
-- Linked `urlmon.lib` / `wininet.lib`  
-
-**Why:** CS2 users are already online; community dumps update after patches without shipping a dumper binary.
-
-**File:** `dragonburn_usermode_final/offsets.h` (+ vcxproj link libs)
-
-**Also expanded schema parsing** for later features: aim punch services, shots fired, velocity, entity identity / designer name, grenade projectile trail fields, smoke, molotov, inferno, `dwGameEntitySystem_highestEntityIndex`.
+**Also expanded schema parsing** for later features: aim punch services, shots fired, velocity, entity identity / designer name, grenade projectile trail fields, smoke, molotov, inferno, `dwGameEntitySystem_highestEntityIndex`, `engine2.dwBuildNumber`.
 
 ---
 

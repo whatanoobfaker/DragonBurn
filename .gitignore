@@ -18,8 +18,10 @@ built/
 *.res
 *.recipe
 
-# Visual Studio
-.vs/
+# Runtime offset cache (downloaded next to usermode exe)
+**/offsets/
+cache_meta.json
+
 *.sln.docstates
 *.vcxproj.user
 *.aps

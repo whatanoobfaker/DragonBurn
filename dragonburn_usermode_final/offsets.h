@@ -1,7 +1,9 @@
 #pragma once
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <urlmon.h>
 #include <wininet.h>
+#include <chrono>
 #include <fstream>
 #include <string>
 #include <cstdint>
@@ -18,6 +20,9 @@ struct Offsets {
         uint32_t dwEntityList, dwViewMatrix, dwViewRender, dwLocalPlayerPawn, dwLocalPlayerController, dwGlobalVars, dwPlantedC4, dwWeaponC4;
         uint32_t dwGameEntitySystem_highestEntityIndex;
     } client;
+    struct {
+        uint32_t dwBuildNumber;
+    } engine2;
     struct {
         uint32_t m_iTeamNum, m_pGameSceneNode, m_iHealth;
         uint32_t m_lifeState;
@@ -116,30 +121,55 @@ struct Offsets {
     } C_Inferno;
 
     bool load(const std::string& offsets_path, const std::string& client_dll_path) {
-        // Always pull fresh dumps from a2x/cs2-dumper on every launch.
-        // Local files are a fallback only when GitHub is unreachable.
-        bool fetched = fetch_remote_offsets(offsets_path, client_dll_path);
-        if (!fetched) {
-            if (std::filesystem::exists(offsets_path) && std::filesystem::exists(client_dll_path)) {
-                printf("[!] Using cached local offset files\n");
-            } else {
-                printf("[-] No remote offsets and no local cache\n");
-                return false;
+        // Smart cache: do NOT hit GitHub on every launch (rate-limit hell while testing).
+        // Refresh when cache is missing/stale, CS2 client.dll changed, build number changed,
+        // or the functional test proves offsets are wrong.
+        const auto meta_path = cache_meta_path(offsets_path);
+        const auto fingerprint = fingerprint_remote_module(L"client.dll");
+
+        bool fetched = false;
+        std::string fetch_reason;
+        if (should_fetch_remote(offsets_path, client_dll_path, meta_path, fingerprint, fetch_reason)) {
+            printf("[*] Offset refresh needed: %s\n", fetch_reason.c_str());
+            fetched = fetch_remote_offsets(offsets_path, client_dll_path);
+            if (!fetched) {
+                if (std::filesystem::exists(offsets_path) && std::filesystem::exists(client_dll_path)) {
+                    printf("[!] Remote fetch failed — falling back to local cache\n");
+                } else {
+                    printf("[-] No remote offsets and no local cache\n");
+                    return false;
+                }
             }
+        } else {
+            printf("[*] Using cached offsets (%s)\n", fetch_reason.c_str());
         }
 
         if (!parse_offsets(offsets_path, client_dll_path)) {
             printf("[!] Failed to parse offsets after download/cache\n");
             if (!fetched) {
-                // Cache might be corrupt — try one more remote pull
+                printf("[*] Cache may be corrupt — forcing remote pull...\n");
                 if (fetch_remote_offsets(offsets_path, client_dll_path) &&
                     parse_offsets(offsets_path, client_dll_path)) {
-                    // ok
+                    fetched = true;
                 } else {
                     return false;
                 }
             } else {
                 return false;
+            }
+        }
+
+        // If CS2 build number changed since last successful run, pull again (a2x may have new dumps).
+        const uint32_t live_build = read_live_build_number();
+        const uint32_t cached_build = read_meta_build_number(meta_path);
+        if (live_build != 0 && cached_build != 0 && live_build != cached_build && !fetched) {
+            printf("[!] CS2 build changed (%u -> %u) — fetching fresh a2x dumps...\n",
+                   cached_build, live_build);
+            if (fetch_remote_offsets(offsets_path, client_dll_path) &&
+                parse_offsets(offsets_path, client_dll_path)) {
+                fetched = true;
+            } else {
+                printf("[!] Fetch after build change failed; continuing with existing cache\n");
             }
         }
 
@@ -150,6 +180,7 @@ struct Offsets {
                 return false;
             if (!parse_offsets(offsets_path, client_dll_path))
                 return false;
+            fetched = true;
             result = functional_test();
             if (result == TestResult::OFFSETS_WRONG) {
                 printf("[!] Offsets still invalid. a2x dump may lag the game update, or patterns broke.\n");
@@ -164,25 +195,215 @@ struct Offsets {
             printf("[+] Offsets validated: successfully read player data\n");
         }
 
+        write_cache_meta(meta_path, fingerprint, live_build != 0 ? live_build : cached_build, fetched);
         return true;
     }
 
 private:
     enum class TestResult { OK, NO_PLAYERS, OFFSETS_WRONG };
 
+    // How long cached a2x JSONs stay valid without a CS2 update signal.
+    static constexpr int kCacheMaxAgeHours = 6;
+
     static constexpr const char* kOffsetsUrl =
         "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json";
     static constexpr const char* kClientDllUrl =
         "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json";
 
+    struct DllFingerprint {
+        std::string path;
+        uint64_t size = 0;
+        int64_t mtime = 0;
+        bool ok = false;
+    };
+
+    static std::filesystem::path cache_meta_path(const std::string& offsets_path) {
+        return std::filesystem::path(offsets_path).parent_path() / "cache_meta.json";
+    }
+
+    static int64_t unix_now() {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    static std::string wide_to_utf8(const wchar_t* w) {
+        if (!w || !w[0]) return {};
+        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 1) return {};
+        std::string out(static_cast<size_t>(n - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
+        return out;
+    }
+
+    static DllFingerprint fingerprint_remote_module(const wchar_t* module_leaf) {
+        DllFingerprint fp;
+        if (!g_memory) return fp;
+        const DWORD pid = g_memory->get_pid();
+        if (!pid) return fp;
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap == INVALID_HANDLE_VALUE) return fp;
+
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
+        bool found = false;
+        wchar_t path[MAX_PATH]{};
+        if (Module32FirstW(snap, &me)) {
+            do {
+                if (_wcsicmp(me.szModule, module_leaf) == 0) {
+                    wcsncpy_s(path, me.szExePath, _TRUNCATE);
+                    found = true;
+                    break;
+                }
+            } while (Module32NextW(snap, &me));
+        }
+        CloseHandle(snap);
+        if (!found || !path[0]) return fp;
+
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
+            return fp;
+
+        ULARGE_INTEGER sz{};
+        sz.LowPart = fad.nFileSizeLow;
+        sz.HighPart = fad.nFileSizeHigh;
+        ULARGE_INTEGER mt{};
+        mt.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+        mt.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+
+        fp.path = wide_to_utf8(path);
+        fp.size = sz.QuadPart;
+        fp.mtime = static_cast<int64_t>(mt.QuadPart);
+        fp.ok = true;
+        return fp;
+    }
+
+    static uint32_t read_meta_build_number(const std::filesystem::path& meta_path) {
+        try {
+            if (!std::filesystem::exists(meta_path)) return 0;
+            std::ifstream in(meta_path);
+            nlohmann::json j;
+            in >> j;
+            return j.value("build_number", 0u);
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    uint32_t read_live_build_number() const {
+        if (!engine2.dwBuildNumber || !g_memory) return 0;
+        const uintptr_t base = g_memory->get_modules().engine2;
+        if (!base) return 0;
+        return g_memory->read<uint32_t>(base + engine2.dwBuildNumber);
+    }
+
+    static bool should_fetch_remote(
+        const std::string& offsets_path,
+        const std::string& client_dll_path,
+        const std::filesystem::path& meta_path,
+        const DllFingerprint& fingerprint,
+        std::string& reason_out)
+    {
+        if (!std::filesystem::exists(offsets_path) || !std::filesystem::exists(client_dll_path)) {
+            reason_out = "no local cache";
+            return true;
+        }
+
+        nlohmann::json meta;
+        bool have_meta = false;
+        try {
+            if (std::filesystem::exists(meta_path)) {
+                std::ifstream in(meta_path);
+                in >> meta;
+                have_meta = true;
+            }
+        } catch (...) {
+            have_meta = false;
+        }
+
+        if (!have_meta) {
+            reason_out = "missing cache_meta.json";
+            return true;
+        }
+
+        const int64_t last = meta.value("last_fetch_unix", (int64_t)0);
+        const int max_age_h = meta.value("max_age_hours", kCacheMaxAgeHours);
+        const int64_t age_s = unix_now() - last;
+        if (last <= 0 || age_s >= static_cast<int64_t>(max_age_h) * 3600) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "cache older than %dh (age=%.1fh)",
+                     max_age_h, age_s / 3600.0);
+            reason_out = buf;
+            return true;
+        }
+
+        if (fingerprint.ok) {
+            const uint64_t old_size = meta.value("client_dll_size", (uint64_t)0);
+            const int64_t old_mtime = meta.value("client_dll_mtime", (int64_t)0);
+            const std::string old_path = meta.value("client_dll_path", std::string{});
+            if (old_size != fingerprint.size || old_mtime != fingerprint.mtime ||
+                (!old_path.empty() && !fingerprint.path.empty() && old_path != fingerprint.path))
+            {
+                reason_out = "client.dll on disk changed (CS2 likely updated)";
+                return true;
+            }
+        }
+
+        char buf[128];
+        snprintf(buf, sizeof(buf), "fresh — age %.1fh / max %dh; client.dll unchanged",
+                 age_s / 3600.0, max_age_h);
+        reason_out = buf;
+        return false;
+    }
+
+    static void write_cache_meta(
+        const std::filesystem::path& meta_path,
+        const DllFingerprint& fingerprint,
+        uint32_t build_number,
+        bool just_fetched)
+    {
+        try {
+            nlohmann::json meta;
+            int64_t last_fetch = unix_now();
+            if (!just_fetched && std::filesystem::exists(meta_path)) {
+                try {
+                    std::ifstream in(meta_path);
+                    nlohmann::json old;
+                    in >> old;
+                    last_fetch = old.value("last_fetch_unix", last_fetch);
+                    if (build_number == 0)
+                        build_number = old.value("build_number", 0u);
+                } catch (...) {}
+            }
+
+            meta["last_fetch_unix"] = last_fetch;
+            meta["max_age_hours"] = kCacheMaxAgeHours;
+            meta["build_number"] = build_number;
+            if (fingerprint.ok) {
+                meta["client_dll_path"] = fingerprint.path;
+                meta["client_dll_size"] = fingerprint.size;
+                meta["client_dll_mtime"] = fingerprint.mtime;
+            }
+            meta["updated_unix"] = unix_now();
+
+            std::filesystem::create_directories(meta_path.parent_path());
+            std::ofstream out(meta_path);
+            out << meta.dump(2);
+            if (just_fetched)
+                printf("[+] Offset cache meta saved (TTL %dh, build=%u)\n",
+                       kCacheMaxAgeHours, build_number);
+        } catch (const std::exception& e) {
+            printf("[!] Failed to write cache meta: %s\n", e.what());
+        }
+    }
+
     bool download_url_to_file(const char* url, const std::filesystem::path& dest) {
         std::filesystem::create_directories(dest.parent_path());
 
-        // Download to a temp file, then rename — avoids half-written JSON on failure
         std::filesystem::path tmp = dest;
         tmp += ".tmp";
 
-        DeleteUrlCacheEntryA(url); // prefer fresh content when possible
+        DeleteUrlCacheEntryA(url);
 
         HRESULT hr = URLDownloadToFileA(nullptr, url, tmp.string().c_str(), 0, nullptr);
         if (FAILED(hr)) {
@@ -192,7 +413,6 @@ private:
             return false;
         }
 
-        // Basic sanity: file exists and isn't empty
         std::error_code ec;
         auto sz = std::filesystem::file_size(tmp, ec);
         if (ec || sz < 32) {
@@ -201,7 +421,6 @@ private:
             return false;
         }
 
-        // Quick JSON sanity (must start with '{')
         {
             std::ifstream in(tmp);
             char c = 0;
@@ -216,7 +435,6 @@ private:
         std::filesystem::remove(dest, ec);
         std::filesystem::rename(tmp, dest, ec);
         if (ec) {
-            // Fallback copy
             try {
                 std::filesystem::copy_file(tmp, dest, std::filesystem::copy_options::overwrite_existing);
                 std::filesystem::remove(tmp);
@@ -232,11 +450,11 @@ private:
     }
 
     bool fetch_remote_offsets(const std::string& offsets_path, const std::string& client_dll_path) {
-        printf("[*] Pulling fresh offsets from a2x/cs2-dumper (every launch)...\n");
+        printf("[*] Fetching offsets from a2x/cs2-dumper (GitHub)...\n");
         bool ok_off = download_url_to_file(kOffsetsUrl, offsets_path);
         bool ok_cli = download_url_to_file(kClientDllUrl, client_dll_path);
         if (ok_off && ok_cli) {
-            printf("[+] Fresh remote offsets ready\n");
+            printf("[+] Remote offsets ready\n");
             return true;
         }
         printf("[!] Remote fetch incomplete (offsets=%s, client_dll=%s)\n",
@@ -270,6 +488,10 @@ private:
             client.dwGameEntitySystem_highestEntityIndex =
                 cl.value("dwGameEntitySystem_highestEntityIndex", 0u);
 
+            engine2.dwBuildNumber = 0;
+            if (oj.contains("engine2.dll"))
+                engine2.dwBuildNumber = oj["engine2.dll"].value("dwBuildNumber", 0u);
+
             auto& cs = cj["client.dll"]["classes"];
             C_BaseEntity.m_iTeamNum = cs["C_BaseEntity"]["fields"]["m_iTeamNum"];
             C_BaseEntity.m_pGameSceneNode = cs["C_BaseEntity"]["fields"]["m_pGameSceneNode"];
@@ -285,7 +507,6 @@ private:
                 cs["CCSPlayerController"]["fields"]["m_sSanitizedPlayerName"];
             CCSPlayerController.m_hPawn =
                 cs["CBasePlayerController"]["fields"]["m_hPawn"];
-            // CHandle — must be parsed; used for observer / map-change logic
             CCSPlayerController.m_hObserverPawn =
                 cs["CCSPlayerController"]["fields"].value("m_hObserverPawn", 0u);
             if (!CCSPlayerController.m_hObserverPawn) {
@@ -308,7 +529,6 @@ private:
                     cs["CCSPlayer_AimPunchServices"]["fields"].value("m_predictableBaseAngle", 0u);
             }
 
-            // Weapon reading offsets
             C_CSPlayerPawnBase.m_pWeaponServices = cs["C_BasePlayerPawn"]["fields"]["m_pWeaponServices"];
             C_CSPlayerPawnBase.m_flFlashDuration = cs["C_CSPlayerPawnBase"]["fields"]["m_flFlashDuration"];
             CPlayer_WeaponServices.m_hActiveWeapon = cs["CPlayer_WeaponServices"]["fields"]["m_hActiveWeapon"];

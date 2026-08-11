@@ -10,7 +10,7 @@ Windows usermode overlay + optional kernel memory driver for CS2. Three projects
 - Visual Studio 2022 (MSVC / WDK for the driver)
 - Administrator privileges for the kernel/kdmapper path
 - CS2 running
-- Internet access **on every launch** (offsets are pulled fresh from [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper) `output/` each run; local files are only a fallback if GitHub is unreachable)
+- Internet access for offset updates (a2x dumps are cached locally; refreshed every **6 hours**, when `client.dll` changes / CS2 build number changes, or if live validation fails — not on every launch)
 
 ## Build order
 
@@ -27,12 +27,23 @@ You do **not** need to copy the driver or mapper next to the usermode exe. When 
 
 ## Offsets
 
-Every launch downloads:
+JSON dumps are downloaded from [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper) into `offsets/` next to the usermode exe:
 
 - `https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json`
 - `https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json`
 
-into `offsets/` next to the usermode executable. Cached copies are used only if the download fails.
+**Fetch policy** (avoids GitHub rate limits while testing):
+
+| Trigger | Action |
+|---------|--------|
+| No local cache / missing `cache_meta.json` | Download |
+| Cache older than **6 hours** | Download |
+| On-disk `client.dll` size/mtime changed (Steam updated CS2) | Download |
+| Live `engine2` build number ≠ last saved | Download |
+| Functional test says offsets are wrong | Download |
+| Otherwise | Reuse local JSON |
+
+Force a refresh by deleting `offsets/cache_meta.json` (or the JSON files).
 
 ## Run
 
