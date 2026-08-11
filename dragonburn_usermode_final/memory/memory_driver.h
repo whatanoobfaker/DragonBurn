@@ -34,6 +34,7 @@ public:
                         return false;
                     case DriverManager::DRIVER_FILE_MISSING:
                         printf("[-] dragonburn_driver.sys or DragonBurn-kernel.exe not found.\n");
+                        printf("    Build driver + mapper; they are resolved from their own build folders.\n");
                         return false;
                     case DriverManager::SETUP_FAILED:
                         printf("[-] DragonBurn-kernel launch failed.\n");

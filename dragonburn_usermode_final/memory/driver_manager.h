@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include "shared.h"
+#include "artifact_paths.h"
 
 class DriverManager {
 public:
@@ -301,10 +302,12 @@ public:
 
         if (!check_file_exists(get_driver_path(true))) {
             printf("[-] dragonburn_driver.sys not found.\n");
+            printf("    Build dragonburn_driver (Release|x64). Expected under dragonburn_driver\\\\x64\\\\Release\\\\\n");
             return DRIVER_FILE_MISSING;
         }
         if (!check_file_exists(get_kdmapper_path())) {
             printf("[-] DragonBurn-kernel.exe not found.\n");
+            printf("    Build dragonburn_kernelmode (Release|x64). Expected under dragonburn_kernelmode\\\\built\\\\\n");
             return DRIVER_FILE_MISSING;
         }
 
@@ -392,8 +395,8 @@ public:
         }
 
         if (!s.driver_file_exists) {
-            printf("[-] Driver file not found: %ls\n", get_driver_path().c_str());
-            printf("    Place dragonburn_driver.sys next to this executable.\n");
+            printf("[-] Driver file not found.\n");
+            printf("    Build dragonburn_driver (Release|x64); no need to copy it beside this exe.\n");
             return DRIVER_FILE_MISSING;
         }
 
@@ -565,7 +568,12 @@ public:
 
 private:
     static bool run_kdmapper() {
-        std::wstring cmd = L"\"" + get_kdmapper_path() + L"\" /wait";
+        const std::wstring mapper = get_kdmapper_path();
+        const std::wstring sys = get_driver_path(true);
+        std::wstring cmd = L"\"" + mapper + L"\" /wait \"" + sys + L"\"";
+
+        printf("[*] Mapper: %ls\n", mapper.c_str());
+        printf("[*] Driver: %ls\n", sys.c_str());
 
         STARTUPINFOW si{};
         PROCESS_INFORMATION pi{};
@@ -637,18 +645,12 @@ private:
     }
 
     static bool check_file_exists(const std::wstring& path) {
-        return std::filesystem::exists(path);
+        return !path.empty() && std::filesystem::exists(path);
     }
 
     static std::wstring get_kdmapper_path() {
-        wchar_t exe_path[MAX_PATH];
-        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-        std::wstring path(exe_path);
-        size_t last_slash = path.find_last_of(L"\\/");
-        if (last_slash != std::wstring::npos)
-            path = path.substr(0, last_slash + 1);
-        path += L"DragonBurn-kernel.exe";
-        return path;
+        auto p = DragonBurnPaths::find_kdmapper_exe();
+        return p.empty() ? L"" : p.wstring();
     }
 
     // ================================================================
@@ -871,7 +873,7 @@ private:
 
     static bool check_driver_file() {
         std::wstring path = get_driver_path();
-        return std::filesystem::exists(path);
+        return !path.empty() && std::filesystem::exists(path);
     }
 
     static bool check_driver_loaded() {
@@ -943,13 +945,8 @@ private:
     }
 
     static std::wstring get_driver_path(bool kdmapper = false) {
-        wchar_t exe_path[MAX_PATH];
-        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-        std::wstring path(exe_path);
-        size_t last_slash = path.find_last_of(L"\\/");
-        if (last_slash != std::wstring::npos)
-            path = path.substr(0, last_slash + 1);
-        path += kdmapper ? KDMP_FILE_NAME : DRIVER_FILE_NAME;
-        return path;
+        (void)kdmapper; // same .sys for both backends in this build
+        auto p = DragonBurnPaths::find_driver_sys();
+        return p.empty() ? L"" : p.wstring();
     }
 };

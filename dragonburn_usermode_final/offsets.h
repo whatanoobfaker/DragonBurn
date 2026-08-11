@@ -116,8 +116,8 @@ struct Offsets {
     } C_Inferno;
 
     bool load(const std::string& offsets_path, const std::string& client_dll_path) {
-        // Always prefer fresh dumps from a2x/cs2-dumper (players are online anyway).
-        // Fall back to local cache if GitHub is unreachable.
+        // Always pull fresh dumps from a2x/cs2-dumper on every launch.
+        // Local files are a fallback only when GitHub is unreachable.
         bool fetched = fetch_remote_offsets(offsets_path, client_dll_path);
         if (!fetched) {
             if (std::filesystem::exists(offsets_path) && std::filesystem::exists(client_dll_path)) {
@@ -232,11 +232,11 @@ private:
     }
 
     bool fetch_remote_offsets(const std::string& offsets_path, const std::string& client_dll_path) {
-        printf("[*] Fetching offsets from a2x/cs2-dumper (GitHub)...\n");
+        printf("[*] Pulling fresh offsets from a2x/cs2-dumper (every launch)...\n");
         bool ok_off = download_url_to_file(kOffsetsUrl, offsets_path);
         bool ok_cli = download_url_to_file(kClientDllUrl, client_dll_path);
         if (ok_off && ok_cli) {
-            printf("[+] Remote offsets ready\n");
+            printf("[+] Fresh remote offsets ready\n");
             return true;
         }
         printf("[!] Remote fetch incomplete (offsets=%s, client_dll=%s)\n",

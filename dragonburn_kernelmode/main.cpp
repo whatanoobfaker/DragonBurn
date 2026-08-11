@@ -65,9 +65,35 @@ int wmain()
 		}
 	}
 
-	std::wstring driver_path = kdmUtils::GetCurrentAppFolder() + L"\\dragonburn_driver.sys";
-	if (!std::filesystem::exists(driver_path)) {
-		Log::Error("dragonburn_driver.sys not found next to this executable");
+	std::wstring driver_path;
+	for (int i = 1; i < __argc; i++) {
+		if (__wargv[i][0] == L'/')
+			continue;
+		driver_path = __wargv[i];
+		break;
+	}
+
+	if (driver_path.empty()) {
+		// Prefer sibling build outputs; fall back to next to this exe
+		const std::wstring folder = kdmUtils::GetCurrentAppFolder();
+		std::vector<std::wstring> cands = {
+			folder + L"\\dragonburn_driver.sys",
+			folder + L"\\..\\..\\dragonburn_driver\\x64\\Release\\dragonburn_driver.sys",
+			folder + L"\\..\\..\\dragonburn_driver\\x64\\Debug\\dragonburn_driver.sys",
+			folder + L"\\..\\..\\dragonburn_driver\\dragonburn_driver\\x64\\Release\\dragonburn_driver.sys",
+			folder + L"\\..\\..\\dragonburn_driver\\dragonburn_driver\\x64\\Debug\\dragonburn_driver.sys",
+		};
+		for (const auto& c : cands) {
+			std::error_code ec;
+			if (std::filesystem::exists(c, ec) && !ec) {
+				driver_path = std::filesystem::weakly_canonical(c, ec).wstring();
+				break;
+			}
+		}
+	}
+
+	if (driver_path.empty() || !std::filesystem::exists(driver_path)) {
+		Log::Error("dragonburn_driver.sys not found. Build the driver project, or pass its path as an argument.");
 	}
 
 	std::vector<uint8_t> driver_data;
@@ -75,7 +101,11 @@ int wmain()
 		Log::Error("Failed to read dragonburn_driver.sys");
 	}
 
-	Log::Fine("Read " + std::to_string(driver_data.size()) + " bytes from dragonburn_driver.sys");
+	{
+		std::string narrow(driver_path.begin(), driver_path.end());
+		Log::Fine("Using driver: " + narrow);
+		Log::Fine("Read " + std::to_string(driver_data.size()) + " bytes from dragonburn_driver.sys");
+	}
 
 	if (!NT_SUCCESS(intel_driver::Load()))
 		Log::Error("Failed to connect to intel driver");

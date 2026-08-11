@@ -8,37 +8,29 @@ Windows usermode overlay + optional kernel memory driver for CS2. Three projects
 - Visual Studio 2022 (MSVC / WDK for the driver)
 - Administrator privileges for the kernel/kdmapper path
 - CS2 running
-- Internet access on first run (offsets are pulled from [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper) `output/`)
+- Internet access **on every launch** (offsets are pulled fresh from [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper) `output/` each run; local files are only a fallback if GitHub is unreachable)
 
 ## Build order
 
 1. **Driver** — open `dragonburn_driver/dragonburn_driver.slnx` (or the `.vcxproj`), build **Release | x64**  
-   Output: `dragonburn_driver.sys`
+   Output: `dragonburn_driver.sys` (typically under `dragonburn_driver/x64/Release/` or `dragonburn_driver/dragonburn_driver/x64/Release/`)
 
 2. **Mapper** — open `dragonburn_kernelmode/DragonBurn-kernel.slnx`, build **Release | x64**  
-   Output: `DragonBurn-kernel.exe`
+   Output: `dragonburn_kernelmode/built/DragonBurn-kernel.exe`
 
 3. **Usermode** — open `dragonburn_usermode_final/Dragonburn-user.sln`, build **Release | x64**  
-   Output: under `dragonburn_usermode_final/build/Release/` (icons + `grenades.json` are post-build copied)
+   Output: `dragonburn_usermode_final/build/Release/` (icons + `grenades.json` are post-build copied)
 
-## Runtime layout
+You do **not** need to copy the driver or mapper next to the usermode exe. When the kernel backend starts, usermode resolves those artifacts from their own build folders (or from an optional path you pass to the mapper). Leaving copies beside the usermode exe still works if you prefer a portable pack.
 
-Place these next to the usermode executable:
+## Offsets
 
-| File | Role |
-|------|------|
-| `dragonburn_driver.sys` | Memory driver |
-| `DragonBurn-kernel.exe` | kdmapper loader |
-| `grenades.json` | Grenade helper data |
-| `icons/` | Weapon icons |
-| `offsets/` | Auto-created; cached copies of a2x dumps |
-
-Offsets are downloaded at startup from:
+Every launch downloads:
 
 - `https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json`
 - `https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json`
 
-Local cache is used only if GitHub is unreachable.
+into `offsets/` next to the usermode executable. Cached copies are used only if the download fails.
 
 ## Run
 
@@ -52,6 +44,12 @@ Restore mapper registry prefs manually if needed:
 
 ```text
 DragonBurn-kernel.exe /restore-host
+```
+
+You can also map manually with an explicit driver path:
+
+```text
+DragonBurn-kernel.exe /wait "C:\path\to\dragonburn_driver.sys"
 ```
 
 ## Memory backends
