@@ -126,6 +126,9 @@ struct LocalPlayerState {
     float x = 0, y = 0, z = 0, yaw = 0;
     bool is_scoped = false;
     CameraState camera;
+    Vec3 aim_punch{};
+    int shots_fired = 0;
+    Vec3 velocity{};
 };
 
 struct FrameState {
@@ -148,8 +151,8 @@ struct FrameState {
 // -----------------------------------------------------------------------
 struct PawnSnapshot {
     // Raw byte buffer covering offset 0 up to the highest offset we need.
-    // Highest needed: m_bIsScoped at 0x1C50 (7248)
-    static constexpr size_t SIZE = 0x1D00;
+    // Highest needed: m_iShotsFired at ~0x1C8C; keep headroom for scoped/etc.
+    static constexpr size_t SIZE = 0x1E00;
     uint8_t buf[SIZE];
 
     template<typename T>
@@ -199,7 +202,13 @@ public:
         state.local.controller = g_memory->read<uintptr_t>(
             g_memory->get_client_base() + g_offsets.client.dwLocalPlayerController);
 
-        state.local.observer_pawn = g_memory->read<uintptr_t>(state.local.controller + g_offsets.CCSPlayerController.m_hObserverPawn);
+        state.local.observer_pawn = 0;
+        if (state.local.controller && g_offsets.CCSPlayerController.m_hObserverPawn) {
+            // Schema field is CHandle (uint32), not a pointer
+            uint32_t obs_handle = g_memory->read<uint32_t>(
+                state.local.controller + g_offsets.CCSPlayerController.m_hObserverPawn);
+            state.local.observer_pawn = obs_handle;
+        }
 
         state.local_player_index = -1;
 
@@ -210,6 +219,21 @@ public:
 
             state.local.team = local_snap.get<int>(g_offsets.C_BaseEntity.m_iTeamNum);
             state.local.is_scoped = local_snap.get<bool>(g_offsets.C_CSPlayerPawn.m_bIsScoped);
+            if (g_offsets.C_CSPlayerPawn.m_iShotsFired)
+                state.local.shots_fired = local_snap.get<int>(g_offsets.C_CSPlayerPawn.m_iShotsFired);
+            if (g_offsets.C_BaseEntity.m_vecAbsVelocity)
+                state.local.velocity = local_snap.get<Vec3>(g_offsets.C_BaseEntity.m_vecAbsVelocity);
+
+            if (g_offsets.C_CSPlayerPawn.m_pAimPunchServices &&
+                g_offsets.CCSPlayer_AimPunchServices.m_predictableBaseAngle)
+            {
+                uintptr_t punch_svc = local_snap.get<uintptr_t>(
+                    g_offsets.C_CSPlayerPawn.m_pAimPunchServices);
+                if (punch_svc) {
+                    state.local.aim_punch = g_memory->read<Vec3>(
+                        punch_svc + g_offsets.CCSPlayer_AimPunchServices.m_predictableBaseAngle);
+                }
+            }
 
             uintptr_t local_scene = local_snap.get<uintptr_t>(
                 g_offsets.C_BaseEntity.m_pGameSceneNode);
@@ -418,6 +442,8 @@ private:
         player.neck_world   = bone_buf[BONE_NECK].pos;
         player.chest_world  = bone_buf[BONE_CHEST].pos;
         player.pelvis_world = bone_buf[BONE_PELVIS].pos;
+        if (g_offsets.C_BaseEntity.m_vecAbsVelocity)
+            player.velocity = snap.get<Vec3>(g_offsets.C_BaseEntity.m_vecAbsVelocity);
 
         memcpy(player.name, name, 128);
 

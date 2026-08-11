@@ -70,7 +70,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)deps\imgui;$(ProjectDir)deps\imgui\backends;$(ProjectDir)deps\json\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dwmapi.lib;windowscodecs.lib;ole32.lib;dxgi.lib;dcomp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dwmapi.lib;windowscodecs.lib;ole32.lib;dxgi.lib;dcomp.lib;urlmon.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
       <EnableUAC>true</EnableUAC>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -108,7 +108,7 @@ copy /Y "$(ProjectDir)grenades.json" "$(OutDir)grenades.json"</Command>
       <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)deps\imgui;$(ProjectDir)deps\imgui\backends;$(ProjectDir)deps\json\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dwmapi.lib;windowscodecs.lib;ole32.lib;dxgi.lib;dcomp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dwmapi.lib;windowscodecs.lib;ole32.lib;dxgi.lib;dcomp.lib;urlmon.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
       <EnableUAC>true</EnableUAC>
       <GenerateDebugInformation>false</GenerateDebugInformation>

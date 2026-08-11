@@ -90,6 +90,26 @@ public:
         if (!pid)
             return false;
 
+        // Register the only PID the driver is allowed to read
+        {
+            SET_TARGET_REQUEST target{};
+            target.target_pid = pid;
+            DWORD returned = 0;
+            BOOL ok = DeviceIoControl(
+                h_driver,
+                IOCTL_SET_TARGET_PID,
+                &target, sizeof(target),
+                nullptr, 0,
+                &returned,
+                nullptr
+            );
+            if (!ok) {
+                printf("[-] Failed to register target pid with driver: %lu\n", GetLastError());
+                pid = 0;
+                return false;
+            }
+        }
+
         // Retry-safe: get module base addresses
         m_modules.client = query_module_base(L"client.dll", &m_modules.client_size);
         m_modules.engine2 = query_module_base(L"engine2.dll", &m_modules.engine2_size);
@@ -112,8 +132,11 @@ public:
         }
 
         if (driver_loaded_by_us) {
-            DriverManager::full_cleanup();
+            DriverManager::full_cleanup(true);
             driver_loaded_by_us = false;
+        } else if (m_use_kdmapper && m_setup_attempted) {
+            // Mapped drivers cannot be unloaded cleanly — restore host prefs only
+            DriverManager::restore_host_state();
         }
 
         pid = 0;

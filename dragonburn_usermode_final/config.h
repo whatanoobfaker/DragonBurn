@@ -162,12 +162,47 @@ public:
         write(f, "key_aimbot", g_settings.key_aimbot);
         write(f, "aimbot_smooth", g_settings.aimbot_smooth);
         write(f, "aimbot_bone", g_settings.aimbot_bone);
+        write(f, "aimbot_multipoint", g_settings.aimbot_multipoint);
+        write(f, "aimbot_visible_check", g_settings.aimbot_visible_check);
+        write(f, "aimbot_draw_fov", g_settings.aimbot_draw_fov);
+        write(f, "aimbot_prediction", g_settings.aimbot_prediction);
+        write(f, "aimbot_predict_time", g_settings.aimbot_predict_time);
+        write(f, "aimbot_humanize", g_settings.aimbot_humanize);
+        write(f, "aimbot_humanize_strength", g_settings.aimbot_humanize_strength);
+        write(f, "aimbot_rcs_compensate", g_settings.aimbot_rcs_compensate);
+
+        f << "\n[RCS]\n";
+        write(f, "rcs_enabled", g_settings.rcs_enabled);
+        write(f, "rcs_strength", g_settings.rcs_strength);
+        write(f, "rcs_start_bullet", g_settings.rcs_start_bullet);
+        write(f, "rcs_standalone", g_settings.rcs_standalone);
 
         f << "\n[Triggerbot]\n";
         write(f, "triggerbot_enabled", g_settings.triggerbot_enabled);
         write(f, "key_triggerbot", g_settings.key_triggerbot);
         write(f, "triggerbot_delay", g_settings.triggerbot_delay);
         write(f, "triggerbot_scoped_only", g_settings.triggerbot_scoped_only);
+        write(f, "triggerbot_always_on", g_settings.triggerbot_always_on);
+
+        f << "\n[WorldESP]\n";
+        write(f, "world_esp_enabled", g_settings.world_esp_enabled);
+        write(f, "world_esp_projectiles", g_settings.world_esp_projectiles);
+        write(f, "world_esp_trails", g_settings.world_esp_trails);
+        write(f, "world_esp_smoke", g_settings.world_esp_smoke);
+        write(f, "world_esp_inferno", g_settings.world_esp_inferno);
+        write(f, "world_esp_labels", g_settings.world_esp_labels);
+        write(f, "world_esp_max_dist", g_settings.world_esp_max_dist);
+        write_arr(f, "world_esp_trail_color", g_settings.world_esp_trail_color, 4);
+        write_arr(f, "world_esp_smoke_color", g_settings.world_esp_smoke_color, 4);
+        write_arr(f, "world_esp_molotov_color", g_settings.world_esp_molotov_color, 4);
+        write_arr(f, "world_esp_flash_color", g_settings.world_esp_flash_color, 4);
+        write_arr(f, "world_esp_he_color", g_settings.world_esp_he_color, 4);
+
+        f << "\n[ExtraESP]\n";
+        write(f, "show_is_scoped", g_settings.show_is_scoped);
+        write(f, "show_flashed_esp", g_settings.show_flashed_esp);
+        write(f, "c4_esp_enabled", g_settings.c4_esp_enabled);
+        write(f, "show_bomb_timer", g_settings.show_bomb_timer);
 
         f.close();
         return true;
@@ -315,11 +350,43 @@ public:
         read(kv, "key_aimbot", g_settings.key_aimbot);
         read(kv, "aimbot_smooth", g_settings.aimbot_smooth);
         read(kv, "aimbot_bone", g_settings.aimbot_bone);
+        read(kv, "aimbot_multipoint", g_settings.aimbot_multipoint);
+        read(kv, "aimbot_visible_check", g_settings.aimbot_visible_check);
+        read(kv, "aimbot_draw_fov", g_settings.aimbot_draw_fov);
+        read(kv, "aimbot_prediction", g_settings.aimbot_prediction);
+        read(kv, "aimbot_predict_time", g_settings.aimbot_predict_time);
+        read(kv, "aimbot_humanize", g_settings.aimbot_humanize);
+        read(kv, "aimbot_humanize_strength", g_settings.aimbot_humanize_strength);
+        read(kv, "aimbot_rcs_compensate", g_settings.aimbot_rcs_compensate);
+
+        read(kv, "rcs_enabled", g_settings.rcs_enabled);
+        read(kv, "rcs_strength", g_settings.rcs_strength);
+        read(kv, "rcs_start_bullet", g_settings.rcs_start_bullet);
+        read(kv, "rcs_standalone", g_settings.rcs_standalone);
 
         read(kv, "triggerbot_enabled", g_settings.triggerbot_enabled);
         read(kv, "key_triggerbot", g_settings.key_triggerbot);
         read(kv, "triggerbot_delay", g_settings.triggerbot_delay);
         read(kv, "triggerbot_scoped_only", g_settings.triggerbot_scoped_only);
+        read(kv, "triggerbot_always_on", g_settings.triggerbot_always_on);
+
+        read(kv, "world_esp_enabled", g_settings.world_esp_enabled);
+        read(kv, "world_esp_projectiles", g_settings.world_esp_projectiles);
+        read(kv, "world_esp_trails", g_settings.world_esp_trails);
+        read(kv, "world_esp_smoke", g_settings.world_esp_smoke);
+        read(kv, "world_esp_inferno", g_settings.world_esp_inferno);
+        read(kv, "world_esp_labels", g_settings.world_esp_labels);
+        read(kv, "world_esp_max_dist", g_settings.world_esp_max_dist);
+        read_arr(kv, "world_esp_trail_color", g_settings.world_esp_trail_color, 4);
+        read_arr(kv, "world_esp_smoke_color", g_settings.world_esp_smoke_color, 4);
+        read_arr(kv, "world_esp_molotov_color", g_settings.world_esp_molotov_color, 4);
+        read_arr(kv, "world_esp_flash_color", g_settings.world_esp_flash_color, 4);
+        read_arr(kv, "world_esp_he_color", g_settings.world_esp_he_color, 4);
+
+        read(kv, "show_is_scoped", g_settings.show_is_scoped);
+        read(kv, "show_flashed_esp", g_settings.show_flashed_esp);
+        read(kv, "c4_esp_enabled", g_settings.c4_esp_enabled);
+        read(kv, "show_bomb_timer", g_settings.show_bomb_timer);
 
         return true;
     }

@@ -19,6 +19,10 @@ struct AimbotFrame {
     bool  camera_valid = false;
     bool  is_scoped = false;
 
+    Vec3  aim_punch{};     // predictable punch angles
+    int   shots_fired = 0;
+    Vec3  local_velocity{};
+
     struct Target {
         bool valid = false;
         int team = 0;
@@ -27,6 +31,7 @@ struct AimbotFrame {
         Vec3 neck_pos{};
         Vec3 chest_pos{};
         Vec3 pelvis_pos{};
+        Vec3 velocity{};
         uint64_t bSpottedByMask = 0;
     };
 

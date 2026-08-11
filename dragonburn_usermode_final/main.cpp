@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <cstdio>
 #include <chrono>
+#include <filesystem>
 #include <imgui.h>
 
 #include "aimbot.h"
@@ -25,30 +26,24 @@
 #include "radar.h"
 #include "grenades.h"
 #include "c4_esp.h"
+#include "world_esp.h"
 #include "input/input.h"
 
 static std::string CONFIG_PATH;
 static volatile bool g_running = true;
 static bool g_driver_backend_active = false;
 
-static bool is_game_focused() {
-    HWND fg = GetForegroundWindow();
-    return (fg == g_overlay.game_hwnd || fg == g_overlay.overlay_hwnd);
-}
-
 static void save_and_exit() {
-    if (!is_game_focused()) {
-        printf("[!] Game not focused, skipping config save\n");
-        return;
-    }
-    Config::save(CONFIG_PATH);
-    printf("[+] Config saved\n");
+    // Always persist — focus should not discard user settings
+    if (Config::save(CONFIG_PATH))
+        printf("[+] Config saved\n");
+    else
+        printf("[!] Config save failed\n");
 }
 
 // Cleanup that ALWAYS runs, no matter how we exit
 static void cleanup_on_exit() {
     stop_aimbot_thread();
-    // Close memory backend (triggers driver unload if driver backend)
     if (g_memory) {
         g_memory->close();
         g_memory.reset();
@@ -75,12 +70,11 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ex) {
     UNREFERENCED_PARAMETER(ex);
     printf("\n[!] Crash detected, cleaning up driver...\n");
 
-    // Force driver cleanup directly (g_memory might be in bad state)
     if (g_driver_backend_active) {
-        DriverManager::full_cleanup();
+        DriverManager::full_cleanup(false);
     }
 
-    return EXCEPTION_CONTINUE_SEARCH; // Let Windows handle the crash
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 enum MemoryBackend {
@@ -89,11 +83,20 @@ enum MemoryBackend {
     KernelDriver = 3
 };
 
+static const char* backend_name(int backend) {
+    switch (backend) {
+        case WinApi: return "WinAPI";
+        case IndirectSyscall: return "Indirect Syscall";
+        case KernelDriver: return "Kernel Driver (kdmapper)";
+        default: return "Unknown";
+    }
+}
+
 std::unique_ptr<IMemory> CreateMemoryBackend(MemoryBackend backend) {
     switch (backend) {
         case WinApi:           return std::make_unique<MemoryWinApi>();
         case IndirectSyscall:  return std::make_unique<MemorySyscall>();
-        case KernelDriver:     return std::make_unique<MemoryDriver>();
+        case KernelDriver:     return std::make_unique<MemoryDriver>(true);
         default:               throw std::runtime_error("invalid backend");
     }
 }
@@ -112,32 +115,31 @@ int main() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ImGui_ImplWin32_EnableDpiAwareness();
 
-    // Elevate to UIAccess so CreateWindowInBand works in exclusive fullscreen
     PrepareForUIAccess();
 
-    // Set up all exit handlers FIRST
     SetConsoleCtrlHandler(console_handler, TRUE);
     SetUnhandledExceptionFilter(crash_handler);
     std::atexit([]() {
         stop_aimbot_thread();
         if (g_driver_backend_active) {
-            DriverManager::full_cleanup();
+            DriverManager::restore_host_state();
         }
     });
 
     if (Config::load(CONFIG_PATH))
         printf("[+] Config loaded\n");
 
+    if (g_settings.memory_backend < WinApi || g_settings.memory_backend > KernelDriver)
+        g_settings.memory_backend = KernelDriver;
+
     g_grenades.init("grenades.json");
 
-    printf("[*] Using kernel driver (kdmapper)\n");
+    const auto backend = static_cast<MemoryBackend>(g_settings.memory_backend);
+    printf("[*] Memory backend: %s\n", backend_name(backend));
+    g_driver_backend_active = (backend == KernelDriver);
 
-    // Track if we're using driver backend (for cleanup handlers)
-    g_driver_backend_active = true;
-
-    // Create memory backend (kernel driver)
     try {
-        g_memory = std::make_unique<MemoryDriver>(true);
+        g_memory = CreateMemoryBackend(backend);
     }
     catch (const std::exception& e) {
         printf("[-] Failed to create backend: %s\n", e.what());
@@ -146,23 +148,31 @@ int main() {
         return 1;
     }
 
-    // Wait for CS2 process (unbounded, like DragonBurn)
-    printf("[*] Waiting for CS2...\n");
-    do {
-        if (g_memory->attach(L"cs2.exe"))
+    // Wait for CS2 process (bounded)
+    constexpr int kAttachTimeoutSec = 300;
+    printf("[*] Waiting for CS2 (timeout %ds)...\n", kAttachTimeoutSec);
+    bool attached = false;
+    for (int i = 0; i < kAttachTimeoutSec; i++) {
+        if (g_memory->attach(L"cs2.exe")) {
+            attached = true;
             break;
-        printf(".");
+        }
+        if (i % 5 == 0)
+            printf(".");
         Sleep(1000);
-    } while (true);
+    }
     printf("\n");
+    if (!attached) {
+        printf("[-] Timed out waiting for cs2.exe\n");
+        cleanup_on_exit();
+        CoUninitialize();
+        system("pause");
+        return 1;
+    }
 
     printf("[+] Attached to cs2.exe (PID: %lu)\n", g_memory->get_pid());
     printf("[+] client.dll base: 0x%llX\n",
         (unsigned long long)g_memory->get_client_base());
-
-    if (g_driver_backend_active) {
-        printf("[+] Using KERNEL DRIVER for memory reads\n");
-    }
 
     // Retry module init up to 30 times (CS2 may still be loading DLLs)
     printf("[*] Initializing addresses");
@@ -173,14 +183,28 @@ int main() {
             inited = true;
             break;
         }
+        // Re-query modules in case DLLs finished loading
+        g_memory->attach(L"cs2.exe");
         Sleep(1000);
     }
     printf("\n");
     if (!inited) {
-        printf("[-] Failed to init addresses after 30s\n");
+        printf("[-] Failed to init addresses after 30s (client.dll base is 0)\n");
+        cleanup_on_exit();
+        CoUninitialize();
+        system("pause");
+        return 1;
     }
 
-    if (!g_offsets.load("offsets/offsets.json", "offsets/client_dll.json")) {
+    // Prefer offsets next to the executable
+    std::string offsets_json = std::string(exe_path) + "offsets\\offsets.json";
+    std::string client_json  = std::string(exe_path) + "offsets\\client_dll.json";
+    if (!std::filesystem::exists(offsets_json)) {
+        offsets_json = "offsets/offsets.json";
+        client_json  = "offsets/client_dll.json";
+    }
+
+    if (!g_offsets.load(offsets_json, client_json)) {
         printf("[-] Failed to load offsets\n");
         cleanup_on_exit();
         CoUninitialize();
@@ -188,17 +212,24 @@ int main() {
         return 1;
     }
 
-    // Wait for CS2 window to exist before creating overlay
-    printf("[*] Waiting for CS2 window...\n");
+    // Wait for CS2 window (bounded)
+    constexpr int kWindowTimeoutSec = 120;
+    printf("[*] Waiting for CS2 window (timeout %ds)...\n", kWindowTimeoutSec);
     HWND cs2_hwnd = nullptr;
-    do {
+    for (int i = 0; i < kWindowTimeoutSec * 2; i++) {
         cs2_hwnd = FindWindowW(L"SDL_app", L"Counter-Strike 2");
         if (cs2_hwnd)
             break;
         Sleep(500);
-    } while (true);
+    }
+    if (!cs2_hwnd) {
+        printf("[-] Timed out waiting for CS2 window\n");
+        cleanup_on_exit();
+        CoUninitialize();
+        system("pause");
+        return 1;
+    }
     printf("[+] CS2 window found\n");
-
     if (!g_overlay.init(L"Counter-Strike 2")) {
         printf("[-] Overlay failed\n");
         cleanup_on_exit();
@@ -246,14 +277,15 @@ int main() {
 
         if (g_settings.menu_open != prev_menu) {
             g_overlay.set_interactive(g_settings.menu_open);
-            if (!g_settings.menu_open && is_game_focused())
-                Config::save(CONFIG_PATH);
+            if (!g_settings.menu_open)
+                Config::save(CONFIG_PATH); // save once when menu closes
             prev_menu = g_settings.menu_open;
         }
 
 
 
-        bool want_aimbot = (g_settings.aimbot_enabled || g_settings.triggerbot_enabled) && g_settings.master_switch;
+        bool want_aimbot = (g_settings.aimbot_enabled || g_settings.triggerbot_enabled ||
+                            g_settings.rcs_enabled) && g_settings.master_switch;
         if (want_aimbot && !was_aimbot_enabled) {
             start_aimbot_thread();
         }
@@ -264,14 +296,6 @@ int main() {
 
         if (!g_overlay.begin_frame()) break;
         g_menu.render();
-        if (g_settings.menu_open && is_game_focused()) {
-            static auto last_save = std::chrono::steady_clock::now();
-            auto now = std::chrono::steady_clock::now();
-            if (now - last_save >= std::chrono::milliseconds(250)) {
-                last_save = now;
-                Config::save(CONFIG_PATH);
-            }
-        }
 
         if (!g_settings.master_switch) {
             static constexpr int IDLE_FPS_CAP = 20;
@@ -283,7 +307,7 @@ int main() {
         FrameState state = entity_reader.read_frame(
             g_overlay.width, g_overlay.height);
 
-        if (g_settings.aimbot_enabled || g_settings.triggerbot_enabled)
+        if (g_settings.aimbot_enabled || g_settings.triggerbot_enabled || g_settings.rcs_enabled)
         {
             AimbotFrame af{};
             af.view_matrix = state.view_matrix;
@@ -297,6 +321,9 @@ int main() {
             af.is_scoped   = state.local.is_scoped;
             af.local_player_index = state.local_player_index;
             af.local_weapon_def_index = state.local_weapon_def_index;
+            af.aim_punch   = state.local.aim_punch;
+            af.shots_fired = state.local.shots_fired;
+            af.local_velocity = state.local.velocity;
 
             if (state.local.camera.valid)
             {
@@ -324,6 +351,7 @@ int main() {
                 af.targets[i].neck_pos   = p.neck_world;
                 af.targets[i].chest_pos  = p.chest_world;
                 af.targets[i].pelvis_pos     = p.pelvis_world;
+                af.targets[i].velocity       = p.velocity;
                 af.targets[i].bSpottedByMask = p.bSpottedByMask;
             }
 
@@ -353,6 +381,9 @@ int main() {
                           view_pitch_deg, view_yaw_deg, state.map_name);
 
         if (state.entity_list) {
+            g_world_esp.update(state.entity_list,
+                { state.local.x, state.local.y, state.local.z });
+
             if (++spec_tick >= 15) {
                 spec_tick = 0;
                 g_spectators.update(state.entity_list,
@@ -361,6 +392,9 @@ int main() {
         }
 
         ImDrawList* draw = ImGui::GetBackgroundDrawList();
+
+        float cam_fov = state.local.camera.valid ? state.local.camera.fov : 90.f;
+        draw_aimbot_fov(draw, g_overlay.width, g_overlay.height, cam_fov);
 
         for (int i = 1; i < EntityList::MAX_PLAYERS; i++) {
             g_esp.draw_player(draw, state.players[i], state.local.team,
@@ -411,6 +445,10 @@ int main() {
         g_grenades.draw(draw,
                         state.local.x, state.local.y, state.local.z,
                         g_overlay.width, g_overlay.height);
+
+        g_world_esp.draw(draw, state.view_matrix,
+                         g_overlay.width, g_overlay.height,
+                         state.local.x, state.local.y, state.local.z);
 
         g_radar.draw(draw, state.radar_players, EntityList::MAX_PLAYERS,
             state.local.x, state.local.y, state.local.yaw, state.local.team,

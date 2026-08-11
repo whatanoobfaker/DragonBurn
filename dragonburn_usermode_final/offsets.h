@@ -1,4 +1,7 @@
 #pragma once
+#include <Windows.h>
+#include <urlmon.h>
+#include <wininet.h>
 #include <fstream>
 #include <string>
 #include <cstdint>
@@ -7,12 +10,18 @@
 #include <nlohmann/json.hpp>
 #include "memory/imemory.h"
 
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "wininet.lib")
+
 struct Offsets {
     struct {
         uint32_t dwEntityList, dwViewMatrix, dwViewRender, dwLocalPlayerPawn, dwLocalPlayerController, dwGlobalVars, dwPlantedC4, dwWeaponC4;
+        uint32_t dwGameEntitySystem_highestEntityIndex;
     } client;
     struct {
         uint32_t m_iTeamNum, m_pGameSceneNode, m_iHealth;
+        uint32_t m_lifeState;
+        uint32_t m_vecAbsVelocity;
     } C_BaseEntity;
     struct {
         uint32_t m_vecAbsOrigin;
@@ -34,7 +43,12 @@ struct Offsets {
     } CPlayer_ObserverServices;
     struct {
         uint32_t m_bIsScoped, m_entitySpottedState;
+        uint32_t m_iShotsFired;
+        uint32_t m_pAimPunchServices;
     } C_CSPlayerPawn;
+    struct {
+        uint32_t m_predictableBaseAngle; // aim punch angles
+    } CCSPlayer_AimPunchServices;
     struct {
         uint32_t m_vecViewOffset;
     } C_BaseModelEntity;
@@ -67,30 +81,78 @@ struct Offsets {
         uint32_t m_flC4Blow;
     } C4;
 
+    struct {
+        uint32_t m_pEntity;
+    } CEntityInstance;
+    struct {
+        uint32_t m_designerName;
+    } CEntityIdentity;
+
+    struct {
+        uint32_t m_vInitialPosition;
+        uint32_t m_vInitialVelocity;
+        uint32_t m_nBounces;
+        uint32_t m_flSpawnTime;
+        uint32_t vecLastTrailLinePos;
+        uint32_t m_arrTrajectoryTrailPoints;
+        uint32_t m_bExplodeEffectBegan;
+    } C_BaseCSGrenadeProjectile;
+
+    struct {
+        uint32_t m_nSmokeEffectTickBegin;
+        uint32_t m_bDidSmokeEffect;
+        uint32_t m_vSmokeDetonationPos;
+    } C_SmokeGrenadeProjectile;
+
+    struct {
+        uint32_t m_bIsIncGrenade;
+    } C_MolotovProjectile;
+
+    struct {
+        uint32_t m_fireCount;
+        uint32_t m_nFireEffectTickBegin;
+        uint32_t m_firePositions;
+        uint32_t m_bFireIsBurning;
+    } C_Inferno;
+
     bool load(const std::string& offsets_path, const std::string& client_dll_path) {
-        if (!std::filesystem::exists(offsets_path) ||
-            !std::filesystem::exists(client_dll_path)) {
-            printf("[!] Offset files not found, running cs2-dumper...\n");
-            if (!run_dumper()) return false;
+        // Always prefer fresh dumps from a2x/cs2-dumper (players are online anyway).
+        // Fall back to local cache if GitHub is unreachable.
+        bool fetched = fetch_remote_offsets(offsets_path, client_dll_path);
+        if (!fetched) {
+            if (std::filesystem::exists(offsets_path) && std::filesystem::exists(client_dll_path)) {
+                printf("[!] Using cached local offset files\n");
+            } else {
+                printf("[-] No remote offsets and no local cache\n");
+                return false;
+            }
         }
 
         if (!parse_offsets(offsets_path, client_dll_path)) {
-            printf("[!] Failed to parse offsets. Running cs2-dumper...\n");
-            if (!run_dumper()) return false;
-            if (!parse_offsets(offsets_path, client_dll_path)) {
-                printf("[!] Still failed after re-dump.\n");
+            printf("[!] Failed to parse offsets after download/cache\n");
+            if (!fetched) {
+                // Cache might be corrupt — try one more remote pull
+                if (fetch_remote_offsets(offsets_path, client_dll_path) &&
+                    parse_offsets(offsets_path, client_dll_path)) {
+                    // ok
+                } else {
+                    return false;
+                }
+            } else {
                 return false;
             }
         }
 
         auto result = functional_test();
         if (result == TestResult::OFFSETS_WRONG) {
-            printf("[!] Offsets are outdated (can't read valid game data). Running cs2-dumper...\n");
-            if (!run_dumper()) return false;
-            if (!parse_offsets(offsets_path, client_dll_path)) return false;
+            printf("[!] Offsets look wrong against live game — re-fetching from GitHub...\n");
+            if (!fetch_remote_offsets(offsets_path, client_dll_path))
+                return false;
+            if (!parse_offsets(offsets_path, client_dll_path))
+                return false;
             result = functional_test();
             if (result == TestResult::OFFSETS_WRONG) {
-                printf("[!] Offsets still invalid after re-dump. Game may have updated.\n");
+                printf("[!] Offsets still invalid. a2x dump may lag the game update, or patterns broke.\n");
                 return false;
             }
         }
@@ -107,6 +169,80 @@ struct Offsets {
 
 private:
     enum class TestResult { OK, NO_PLAYERS, OFFSETS_WRONG };
+
+    static constexpr const char* kOffsetsUrl =
+        "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json";
+    static constexpr const char* kClientDllUrl =
+        "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json";
+
+    bool download_url_to_file(const char* url, const std::filesystem::path& dest) {
+        std::filesystem::create_directories(dest.parent_path());
+
+        // Download to a temp file, then rename — avoids half-written JSON on failure
+        std::filesystem::path tmp = dest;
+        tmp += ".tmp";
+
+        DeleteUrlCacheEntryA(url); // prefer fresh content when possible
+
+        HRESULT hr = URLDownloadToFileA(nullptr, url, tmp.string().c_str(), 0, nullptr);
+        if (FAILED(hr)) {
+            printf("[!] Download failed (%s) HRESULT=0x%08lX\n", url, (unsigned long)hr);
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+
+        // Basic sanity: file exists and isn't empty
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(tmp, ec);
+        if (ec || sz < 32) {
+            printf("[!] Downloaded file looks empty/invalid: %s\n", tmp.string().c_str());
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+
+        // Quick JSON sanity (must start with '{')
+        {
+            std::ifstream in(tmp);
+            char c = 0;
+            in >> c;
+            if (c != '{') {
+                printf("[!] Downloaded content is not JSON object: %s\n", dest.filename().string().c_str());
+                std::filesystem::remove(tmp, ec);
+                return false;
+            }
+        }
+
+        std::filesystem::remove(dest, ec);
+        std::filesystem::rename(tmp, dest, ec);
+        if (ec) {
+            // Fallback copy
+            try {
+                std::filesystem::copy_file(tmp, dest, std::filesystem::copy_options::overwrite_existing);
+                std::filesystem::remove(tmp);
+            } catch (const std::exception& e) {
+                printf("[!] Failed to finalize %s: %s\n", dest.string().c_str(), e.what());
+                return false;
+            }
+        }
+
+        printf("[+] Downloaded %s (%llu bytes)\n", dest.filename().string().c_str(),
+               (unsigned long long)sz);
+        return true;
+    }
+
+    bool fetch_remote_offsets(const std::string& offsets_path, const std::string& client_dll_path) {
+        printf("[*] Fetching offsets from a2x/cs2-dumper (GitHub)...\n");
+        bool ok_off = download_url_to_file(kOffsetsUrl, offsets_path);
+        bool ok_cli = download_url_to_file(kClientDllUrl, client_dll_path);
+        if (ok_off && ok_cli) {
+            printf("[+] Remote offsets ready\n");
+            return true;
+        }
+        printf("[!] Remote fetch incomplete (offsets=%s, client_dll=%s)\n",
+               ok_off ? "ok" : "fail", ok_cli ? "ok" : "fail");
+        return false;
+    }
 
     bool parse_offsets(const std::string& offsets_path, const std::string& client_dll_path) {
         try {
@@ -131,11 +267,15 @@ private:
             client.dwGlobalVars = cl["dwGlobalVars"];
             client.dwPlantedC4 = cl.value("dwPlantedC4", 0u);
             client.dwWeaponC4 = cl.value("dwWeaponC4", 0u);
+            client.dwGameEntitySystem_highestEntityIndex =
+                cl.value("dwGameEntitySystem_highestEntityIndex", 0u);
 
             auto& cs = cj["client.dll"]["classes"];
             C_BaseEntity.m_iTeamNum = cs["C_BaseEntity"]["fields"]["m_iTeamNum"];
             C_BaseEntity.m_pGameSceneNode = cs["C_BaseEntity"]["fields"]["m_pGameSceneNode"];
             C_BaseEntity.m_iHealth = cs["C_BaseEntity"]["fields"]["m_iHealth"];
+            C_BaseEntity.m_lifeState = cs["C_BaseEntity"]["fields"].value("m_lifeState", 0u);
+            C_BaseEntity.m_vecAbsVelocity = cs["C_BaseEntity"]["fields"].value("m_vecAbsVelocity", 0u);
             CGameSceneNode.m_vecAbsOrigin = cs["CGameSceneNode"]["fields"]["m_vecAbsOrigin"];
             CSkeletonInstance.m_modelState = cs["CSkeletonInstance"]["fields"]["m_modelState"];
 
@@ -145,6 +285,12 @@ private:
                 cs["CCSPlayerController"]["fields"]["m_sSanitizedPlayerName"];
             CCSPlayerController.m_hPawn =
                 cs["CBasePlayerController"]["fields"]["m_hPawn"];
+            // CHandle — must be parsed; used for observer / map-change logic
+            CCSPlayerController.m_hObserverPawn =
+                cs["CCSPlayerController"]["fields"].value("m_hObserverPawn", 0u);
+            if (!CCSPlayerController.m_hObserverPawn) {
+                printf("[!] m_hObserverPawn missing from dump — observer/map triggers degraded\n");
+            }
 
             C_BasePlayerPawn.m_pObserverServices =
                 cs["C_BasePlayerPawn"]["fields"]["m_pObserverServices"];
@@ -152,8 +298,15 @@ private:
                 cs["CPlayer_ObserverServices"]["fields"]["m_hObserverTarget"];
 
             C_CSPlayerPawn.m_bIsScoped = cs["C_CSPlayerPawn"]["fields"]["m_bIsScoped"];
+            C_CSPlayerPawn.m_iShotsFired = cs["C_CSPlayerPawn"]["fields"].value("m_iShotsFired", 0u);
+            C_CSPlayerPawn.m_pAimPunchServices = cs["C_CSPlayerPawn"]["fields"].value("m_pAimPunchServices", 0u);
             C_BaseModelEntity.m_vecViewOffset =
                 cs["C_BaseModelEntity"]["fields"]["m_vecViewOffset"];
+
+            if (cs.contains("CCSPlayer_AimPunchServices")) {
+                CCSPlayer_AimPunchServices.m_predictableBaseAngle =
+                    cs["CCSPlayer_AimPunchServices"]["fields"].value("m_predictableBaseAngle", 0u);
+            }
 
             // Weapon reading offsets
             C_CSPlayerPawnBase.m_pWeaponServices = cs["C_BasePlayerPawn"]["fields"]["m_pWeaponServices"];
@@ -175,6 +328,37 @@ private:
                 C4.m_flDefuseCountDown = c4f.value("m_flDefuseCountDown", 0u);
                 C4.m_nBombSite = c4f.value("m_nBombSite", 0u);
                 C4.m_flC4Blow = c4f.value("m_flC4Blow", 0u);
+            }
+
+            CEntityInstance.m_pEntity = cs["CEntityInstance"]["fields"].value("m_pEntity", 0u);
+            CEntityIdentity.m_designerName = cs["CEntityIdentity"]["fields"].value("m_designerName", 0u);
+
+            if (cs.contains("C_BaseCSGrenadeProjectile")) {
+                auto& gf = cs["C_BaseCSGrenadeProjectile"]["fields"];
+                C_BaseCSGrenadeProjectile.m_vInitialPosition = gf.value("m_vInitialPosition", 0u);
+                C_BaseCSGrenadeProjectile.m_vInitialVelocity = gf.value("m_vInitialVelocity", 0u);
+                C_BaseCSGrenadeProjectile.m_nBounces = gf.value("m_nBounces", 0u);
+                C_BaseCSGrenadeProjectile.m_flSpawnTime = gf.value("m_flSpawnTime", 0u);
+                C_BaseCSGrenadeProjectile.vecLastTrailLinePos = gf.value("vecLastTrailLinePos", 0u);
+                C_BaseCSGrenadeProjectile.m_arrTrajectoryTrailPoints = gf.value("m_arrTrajectoryTrailPoints", 0u);
+                C_BaseCSGrenadeProjectile.m_bExplodeEffectBegan = gf.value("m_bExplodeEffectBegan", 0u);
+            }
+            if (cs.contains("C_SmokeGrenadeProjectile")) {
+                auto& sf = cs["C_SmokeGrenadeProjectile"]["fields"];
+                C_SmokeGrenadeProjectile.m_nSmokeEffectTickBegin = sf.value("m_nSmokeEffectTickBegin", 0u);
+                C_SmokeGrenadeProjectile.m_bDidSmokeEffect = sf.value("m_bDidSmokeEffect", 0u);
+                C_SmokeGrenadeProjectile.m_vSmokeDetonationPos = sf.value("m_vSmokeDetonationPos", 0u);
+            }
+            if (cs.contains("C_MolotovProjectile")) {
+                C_MolotovProjectile.m_bIsIncGrenade =
+                    cs["C_MolotovProjectile"]["fields"].value("m_bIsIncGrenade", 0u);
+            }
+            if (cs.contains("C_Inferno")) {
+                auto& inf = cs["C_Inferno"]["fields"];
+                C_Inferno.m_fireCount = inf.value("m_fireCount", 0u);
+                C_Inferno.m_nFireEffectTickBegin = inf.value("m_nFireEffectTickBegin", 0u);
+                C_Inferno.m_firePositions = inf.value("m_firePositions", 0u);
+                C_Inferno.m_bFireIsBurning = inf.value("m_bFireIsBurning", 0u);
             }
 
             return true;
@@ -251,68 +435,6 @@ private:
         printf("[!] Functional test failed: %d valid, %d bogus reads\n",
                valid_players, bogus_reads);
         return TestResult::OFFSETS_WRONG;
-    }
-
-    bool run_dumper() {
-        const char* dumper = "cs2-dumper.exe";
-
-        if (!std::filesystem::exists(dumper)) {
-            printf("[!] %s not found in current directory\n", dumper);
-            printf("[!] Download from https://github.com/a2x/cs2-dumper/releases\n");
-            printf("[!] Place next to this executable and restart.\n");
-            return false;
-        }
-
-        printf("[*] Running %s...\n", dumper);
-        int ret = system(dumper);
-        if (ret != 0) {
-            printf("[!] cs2-dumper failed with code %d\n", ret);
-            return false;
-        }
-
-        const char* dump_dir = "output";
-        if (!std::filesystem::exists(dump_dir)) {
-            printf("[!] cs2-dumper output directory '%s' not found\n", dump_dir);
-            return false;
-        }
-
-        std::filesystem::create_directories("offsets");
-
-        struct FileCopy {
-            const char* src;
-            const char* dst;
-        };
-        static const FileCopy needed[] = {
-            {"output/offsets.json",    "offsets/offsets.json"},
-            {"output/client_dll.json", "offsets/client_dll.json"},
-        };
-
-        bool ok = true;
-        for (const auto& fc : needed) {
-            if (std::filesystem::exists(fc.src)) {
-                try {
-                    if (std::filesystem::exists(fc.dst))
-                        std::filesystem::remove(fc.dst);
-                    std::filesystem::copy_file(fc.src, fc.dst);
-                    printf("[+] Copied %s -> %s\n", fc.src, fc.dst);
-                } catch (const std::exception& e) {
-                    printf("[!] Failed to copy %s: %s\n", fc.src, e.what());
-                    ok = false;
-                }
-            } else {
-                printf("[!] Expected file %s not found in dumper output\n", fc.src);
-                ok = false;
-            }
-        }
-
-        try {
-            std::filesystem::remove_all(dump_dir);
-            printf("[+] Cleaned up %s/\n", dump_dir);
-        } catch (const std::exception& e) {
-            printf("[!] Failed to clean up %s: %s\n", dump_dir, e.what());
-        }
-
-        return ok;
     }
 };
 

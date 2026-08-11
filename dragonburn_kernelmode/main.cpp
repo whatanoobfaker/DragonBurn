@@ -4,6 +4,7 @@
 #include <vector>
 #include <filesystem>
 #include <sstream>
+#include <fstream>
 
 #include "kdmapper.h"
 #include "utils.h"
@@ -12,7 +13,9 @@
 
 LONG WINAPI SimplestCrashHandler(EXCEPTION_POINTERS* ExceptionInfo);
 bool CheckWindowsKernelPrefs();
-void ApplyRecommendedPrefs();
+bool ApplyRecommendedPrefs();
+void RestoreRecommendedPrefs();
+std::wstring HostStatePath();
 
 int wmain()
 {
@@ -23,6 +26,10 @@ int wmain()
 		if (wcscmp(__wargv[i], L"/wait") == 0 || wcscmp(__wargv[i], L"/pause") == 0) {
 			waitForKey = true;
 			break;
+		}
+		if (wcscmp(__wargv[i], L"/restore-host") == 0) {
+			RestoreRecommendedPrefs();
+			return 0;
 		}
 	}
 
@@ -35,25 +42,24 @@ int wmain()
 		return 0;
 	}
 
-	/* Stop anti-cheat services that may interfere with vulnerable driver load */
-	system("sc stop faceit >nul 2>&1");
-	system("sc stop vgc >nul 2>&1");
-	system("sc stop vgk >nul 2>&1");
-
-	/* Check and apply kernel prefs like the original DragonBurn */
+	/* Check and apply kernel prefs — do NOT stop third-party services */
 	if (!CheckWindowsKernelPrefs())
 	{
 		Log::Warning("Some kernel preferences may interfere with driver loading.");
 		std::string response;
 		do
 		{
-			Log::Info("Apply recommended settings and reboot? (y/n)");
+			Log::Info("Apply recommended settings (saved for restore) and reboot? (y/n)");
 			std::cout << ">>> "; std::cin >> response;
 		} while (response != "y" && response != "n");
 		if (response == "y")
 		{
-			ApplyRecommendedPrefs();
-			Log::Fine("Settings applied. Reboot required.");
+			if (!ApplyRecommendedPrefs()) {
+				Log::Error("Failed to apply recommended settings", false);
+				return -1;
+			}
+			Log::Fine("Settings applied and saved. Reboot required.");
+			Log::Info("After you are done, run: DragonBurn-kernel.exe /restore-host");
 			system("pause");
 			return -1;
 		}
@@ -87,6 +93,7 @@ int wmain()
 		Log::Warning("Warning failed to unload intel driver", true);
 
 	Log::Fine("dragonburn_driver.sys mapped successfully");
+	Log::Info("Mapped drivers stay until reboot. Use /restore-host later to undo registry prefs.");
 
 	if (waitForKey) {
 		Log::Custom("--- Mapping complete. Press any key to close this window ---", 8);
@@ -96,66 +103,122 @@ int wmain()
 	return 0;
 }
 
+std::wstring HostStatePath()
+{
+	return kdmUtils::GetCurrentAppFolder() + L"\\dragonburn_mapper_host_state.txt";
+}
+
+static bool QueryDword(HKEY root, const char* subkey, const char* name, DWORD* out, DWORD def)
+{
+	*out = def;
+	HKEY hKey = nullptr;
+	if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+		return false;
+	DWORD size = sizeof(DWORD), type = 0;
+	LONG st = RegQueryValueExA(hKey, name, nullptr, &type, (LPBYTE)out, &size);
+	RegCloseKey(hKey);
+	return st == ERROR_SUCCESS && type == REG_DWORD;
+}
+
 bool CheckWindowsKernelPrefs()
 {
-	/* Check all relevant settings like the original DragonBurn */
-	
 	/* Vulnerable Driver Blocklist */
 	{
-		HKEY hKey;
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\CI\\Config", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-			DWORD data = 1, size = sizeof(data), type = 0;
-			RegQueryValueExA(hKey, "VulnerableDriverBlocklistEnable", nullptr, &type, (LPBYTE)&data, &size);
-			RegCloseKey(hKey);
-			if (type == REG_DWORD && data != 0) return false;
-		}
+		DWORD data = 0;
+		if (QueryDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+			"VulnerableDriverBlocklistEnable", &data, 0) && data != 0)
+			return false;
 	}
 
 	/* HypervisorEnforcedCodeIntegrity (HVCI) */
 	{
-		HKEY hKey;
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-			DWORD data = 1, size = sizeof(data), type = 0;
-			RegQueryValueExA(hKey, "Enabled", nullptr, &type, (LPBYTE)&data, &size);
-			RegCloseKey(hKey);
-			if (type == REG_DWORD && data != 0) return false;
-		}
-	}
-
-	/* RunAsPPL (Protected Process Light) */
-	{
-		HKEY hKey;
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Lsa", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-			DWORD data = 0, size = sizeof(data), type = 0;
-			RegQueryValueExA(hKey, "RunAsPPL", nullptr, &type, (LPBYTE)&data, &size);
-			RegCloseKey(hKey);
-			if (type == REG_DWORD && data != 0) return false;
-		}
-	}
-
-	/* VirtualizationBasedSecurity */
-	{
-		HKEY hKey;
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "System\\CurrentControlSet\\Control\\DeviceGuard", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-			DWORD data = 1, size = sizeof(data), type = 0;
-			RegQueryValueExA(hKey, "EnableVirtualizationBasedSecurity", nullptr, &type, (LPBYTE)&data, &size);
-			RegCloseKey(hKey);
-			if (type == REG_DWORD && data != 0) return false;
-		}
+		DWORD data = 0;
+		if (QueryDword(HKEY_LOCAL_MACHINE,
+			"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+			"Enabled", &data, 0) && data != 0)
+			return false;
 	}
 
 	return true;
 }
 
-void ApplyRecommendedPrefs()
+bool ApplyRecommendedPrefs()
 {
-	Log::Info("Applying recommended kernel preferences...");
+	Log::Info("Saving current kernel preferences, then applying recommended values...");
+
+	DWORD prev_blocklist = 1, prev_hvci = 1, prev_ppl = 0, prev_vbs = 0;
+	QueryDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+		"VulnerableDriverBlocklistEnable", &prev_blocklist, 1);
+	QueryDword(HKEY_LOCAL_MACHINE,
+		"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+		"Enabled", &prev_hvci, 1);
+	QueryDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+		"RunAsPPL", &prev_ppl, 0);
+	QueryDword(HKEY_LOCAL_MACHINE, "System\\CurrentControlSet\\Control\\DeviceGuard",
+		"EnableVirtualizationBasedSecurity", &prev_vbs, 0);
+
+	{
+		std::wofstream out(HostStatePath());
+		if (!out) {
+			Log::Error("Could not write host state file", false);
+			return false;
+		}
+		out << L"prev_blocklist=" << prev_blocklist << L"\n";
+		out << L"prev_hvci=" << prev_hvci << L"\n";
+		out << L"prev_ppl=" << prev_ppl << L"\n";
+		out << L"prev_vbs=" << prev_vbs << L"\n";
+		out << L"changed=1\n";
+	}
+
 	system("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity\" /v Enabled /t REG_DWORD /d 0 /f >nul 2>&1");
 	system("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\" /v RunAsPPL /t REG_DWORD /d 0 /f >nul 2>&1");
 	system("reg add \"HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Control\\DeviceGuard\" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 00000000 /f >nul 2>&1");
 	system("bcdedit /set hypervisorlaunchtype off >nul 2>&1");
 	system("reg add \"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config\" /v VulnerableDriverBlocklistEnable /t REG_DWORD /d 00000000 /f >nul 2>&1");
-	Log::Fine("Done.");
+	Log::Fine("Done. Original values saved to dragonburn_mapper_host_state.txt");
+	return true;
+}
+
+void RestoreRecommendedPrefs()
+{
+	std::wifstream in(HostStatePath());
+	if (!in) {
+		Log::Warning("No mapper host state file found — nothing to restore", true);
+		return;
+	}
+
+	DWORD prev_blocklist = 1, prev_hvci = 1, prev_ppl = 0, prev_vbs = 0;
+	bool changed = false;
+	std::wstring line;
+	while (std::getline(in, line)) {
+		if (line.rfind(L"prev_blocklist=", 0) == 0) prev_blocklist = (DWORD)_wtoi(line.c_str() + 15);
+		else if (line.rfind(L"prev_hvci=", 0) == 0) prev_hvci = (DWORD)_wtoi(line.c_str() + 10);
+		else if (line.rfind(L"prev_ppl=", 0) == 0) prev_ppl = (DWORD)_wtoi(line.c_str() + 9);
+		else if (line.rfind(L"prev_vbs=", 0) == 0) prev_vbs = (DWORD)_wtoi(line.c_str() + 9);
+		else if (line.rfind(L"changed=", 0) == 0) changed = _wtoi(line.c_str() + 8) != 0;
+	}
+	in.close();
+
+	if (!changed) {
+		Log::Info("Host state present but not marked changed.");
+		return;
+	}
+
+	Log::Info("Restoring previous kernel preferences...");
+
+	auto set_dword = [](const char* key, const char* name, DWORD value) {
+		char cmd[512];
+		sprintf_s(cmd, "reg add \"%s\" /v %s /t REG_DWORD /d %lu /f >nul 2>&1", key, name, value);
+		system(cmd);
+	};
+
+	set_dword("HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config", "VulnerableDriverBlocklistEnable", prev_blocklist);
+	set_dword("HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled", prev_hvci);
+	set_dword("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa", "RunAsPPL", prev_ppl);
+	set_dword("HKLM\\System\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity", prev_vbs);
+
+	DeleteFileW(HostStatePath().c_str());
+	Log::Fine("Restored. Reboot for registry/BCD changes to take full effect.");
 }
 
 LONG WINAPI SimplestCrashHandler(EXCEPTION_POINTERS* ExceptionInfo)

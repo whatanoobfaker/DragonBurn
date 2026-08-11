@@ -110,42 +110,184 @@ public:
         return exit_code == 0;
     }
 
-    static void add_exclusions() {
-        static bool already_done = false;
-        if (already_done)
-            return;
-        already_done = true;
+    static bool remove_defender_exclusion(const std::wstring& path) {
+        std::wstring cmd = L"powershell -Command \"Remove-MpPreference -ExclusionPath '"
+                         + path + L"' -ErrorAction SilentlyContinue -Force\"";
+        PROCESS_INFORMATION pi{};
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
 
-        auto exclude_path = [](const std::wstring& path, const char* label) {
-            if (is_path_excluded(path)) {
-                printf("[+] Already excluded %s: %ls\n", label, path.c_str());
-                return true;
-            }
-            printf("[*] Adding %s: %ls\n", label, path.c_str());
-            if (add_defender_exclusion(path)) {
-                printf("[+] Excluded %s: %ls\n", label, path.c_str());
-                return true;
-            }
-            printf("[!] Failed to exclude %s: %ls\n", label, path.c_str());
+        if (!CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()),
+                nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                nullptr, nullptr, &si, &pi))
             return false;
-        };
 
-        // Exclude our own directory
+        WaitForSingleObject(pi.hProcess, 15000);
+        DWORD exit_code = 1;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return exit_code == 0;
+    }
+
+    // Tracks host mutations so we can reverse them on exit.
+    struct HostMutationState {
+        bool valid = false;
+        bool added_exe_exclusion = false;
+        bool changed_blocklist = false;
+        bool changed_hvci = false;
+        DWORD prev_blocklist = 1;
+        DWORD prev_hvci = 1;
+        wchar_t exe_dir[MAX_PATH]{};
+    };
+
+    static HostMutationState& host_state() {
+        static HostMutationState s;
+        return s;
+    }
+
+    static std::wstring host_state_path() {
+        wchar_t exe_path[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        std::wstring path(exe_path);
+        size_t last_slash = path.find_last_of(L"\\/");
+        if (last_slash != std::wstring::npos)
+            path = path.substr(0, last_slash + 1);
+        path += L"dragonburn_host_state.txt";
+        return path;
+    }
+
+    static void persist_host_state() {
+        const auto& s = host_state();
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, host_state_path().c_str(), L"w") != 0 || !f)
+            return;
+        fwprintf(f, L"valid=1\n");
+        fwprintf(f, L"added_exe_exclusion=%d\n", s.added_exe_exclusion ? 1 : 0);
+        fwprintf(f, L"changed_blocklist=%d\n", s.changed_blocklist ? 1 : 0);
+        fwprintf(f, L"changed_hvci=%d\n", s.changed_hvci ? 1 : 0);
+        fwprintf(f, L"prev_blocklist=%lu\n", s.prev_blocklist);
+        fwprintf(f, L"prev_hvci=%lu\n", s.prev_hvci);
+        fwprintf(f, L"exe_dir=%ls\n", s.exe_dir);
+        fclose(f);
+    }
+
+    static void load_host_state_file() {
+        auto& s = host_state();
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, host_state_path().c_str(), L"r") != 0 || !f)
+            return;
+
+        wchar_t line[1024];
+        while (fgetws(line, 1024, f)) {
+            if (wcsncmp(line, L"valid=", 6) == 0) s.valid = _wtoi(line + 6) != 0;
+            else if (wcsncmp(line, L"added_exe_exclusion=", 20) == 0) s.added_exe_exclusion = _wtoi(line + 20) != 0;
+            else if (wcsncmp(line, L"changed_blocklist=", 18) == 0) s.changed_blocklist = _wtoi(line + 18) != 0;
+            else if (wcsncmp(line, L"changed_hvci=", 13) == 0) s.changed_hvci = _wtoi(line + 13) != 0;
+            else if (wcsncmp(line, L"prev_blocklist=", 15) == 0) s.prev_blocklist = (DWORD)_wtol(line + 15);
+            else if (wcsncmp(line, L"prev_hvci=", 10) == 0) s.prev_hvci = (DWORD)_wtol(line + 10);
+            else if (wcsncmp(line, L"exe_dir=", 8) == 0) {
+                wchar_t* val = line + 8;
+                size_t n = wcslen(val);
+                while (n && (val[n - 1] == L'\n' || val[n - 1] == L'\r'))
+                    val[--n] = 0;
+                wcsncpy_s(s.exe_dir, val, _TRUNCATE);
+            }
+        }
+        fclose(f);
+    }
+
+    static bool set_reg_dword(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD value) {
+        HKEY hKey = nullptr;
+        LONG result = RegCreateKeyExW(root, subkey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr);
+        if (result != ERROR_SUCCESS) return false;
+        result = RegSetValueExW(hKey, name, 0, REG_DWORD, (LPBYTE)&value, sizeof(value));
+        RegCloseKey(hKey);
+        return result == ERROR_SUCCESS;
+    }
+
+    static bool query_reg_dword(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD* out, DWORD default_value) {
+        *out = default_value;
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+            return false;
+        DWORD size = sizeof(DWORD);
+        DWORD type = 0;
+        LONG result = RegQueryValueExW(hKey, name, nullptr, &type, (LPBYTE)out, &size);
+        RegCloseKey(hKey);
+        return result == ERROR_SUCCESS && type == REG_DWORD;
+    }
+
+    static void add_exclusions() {
+        auto& s = host_state();
+        load_host_state_file();
+
         wchar_t exe_path[MAX_PATH];
         GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
         std::wstring exe_dir(exe_path);
         size_t last_slash = exe_dir.find_last_of(L"\\/");
         if (last_slash != std::wstring::npos)
             exe_dir = exe_dir.substr(0, last_slash);
-        exclude_path(exe_dir, "build directory");
+        wcsncpy_s(s.exe_dir, exe_dir.c_str(), _TRUNCATE);
 
-        // Exclude temp folder (mapper copies Intel driver there)
-        wchar_t temp_path[MAX_PATH];
-        GetTempPathW(MAX_PATH, temp_path);
-        std::wstring temp_dir(temp_path);
-        if (!temp_dir.empty() && temp_dir.back() == L'\\')
-            temp_dir.pop_back();
-        exclude_path(temp_dir, "temp directory");
+        // Only exclude our own directory — never the entire %TEMP%.
+        if (!is_path_excluded(exe_dir)) {
+            printf("[*] Adding Defender exclusion for build directory only: %ls\n", exe_dir.c_str());
+            if (add_defender_exclusion(exe_dir)) {
+                printf("[+] Excluded build directory\n");
+                s.added_exe_exclusion = true;
+            } else {
+                printf("[!] Failed to exclude build directory\n");
+            }
+        } else {
+            printf("[+] Build directory already excluded\n");
+        }
+
+        s.valid = true;
+        persist_host_state();
+    }
+
+    static void restore_host_state() {
+        load_host_state_file();
+        auto& s = host_state();
+        if (!s.valid) {
+            printf("[*] No host mutation state to restore.\n");
+            return;
+        }
+
+        printf("[*] Restoring host security settings we changed...\n");
+
+        if (s.added_exe_exclusion && s.exe_dir[0]) {
+            if (remove_defender_exclusion(s.exe_dir))
+                printf("[+] Removed Defender exclusion: %ls\n", s.exe_dir);
+            else
+                printf("[!] Failed to remove Defender exclusion: %ls\n", s.exe_dir);
+            s.added_exe_exclusion = false;
+        }
+
+        if (s.changed_blocklist) {
+            if (set_reg_dword(HKEY_LOCAL_MACHINE,
+                    L"SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+                    L"VulnerableDriverBlocklistEnable", s.prev_blocklist))
+                printf("[+] Restored Vulnerable Driver Blocklist to %lu (reboot to apply)\n", s.prev_blocklist);
+            else
+                printf("[!] Failed to restore Vulnerable Driver Blocklist\n");
+            s.changed_blocklist = false;
+        }
+
+        if (s.changed_hvci) {
+            if (set_reg_dword(HKEY_LOCAL_MACHINE,
+                    L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+                    L"Enabled", s.prev_hvci))
+                printf("[+] Restored Memory Integrity (HVCI) to %lu (reboot to apply)\n", s.prev_hvci);
+            else
+                printf("[!] Failed to restore Memory Integrity\n");
+            s.changed_hvci = false;
+        }
+
+        s.valid = false;
+        DeleteFileW(host_state_path().c_str());
+        printf("[+] Host state restore finished.\n");
     }
 
     static SetupResult setup_kdmapper() {
@@ -154,7 +296,7 @@ public:
             return NEED_ADMIN;
         }
 
-        // Add Windows Defender exclusions (checks first, only adds if missing)
+        // Narrow Defender exclusion (build dir only) + track for restore
         add_exclusions();
 
         if (!check_file_exists(get_driver_path(true))) {
@@ -167,11 +309,20 @@ public:
         }
 
         bool need_reboot = false;
+        auto& s = host_state();
 
         // -- Vulnerable Driver Blocklist --
         if (check_vulnerable_driver_blocklist()) {
-            printf("[*] Vulnerable Driver Blocklist is enabled. Disabling...\n");
+            printf("[*] Vulnerable Driver Blocklist is enabled. Disabling (will restore on exit)...\n");
+            DWORD prev = 1;
+            query_reg_dword(HKEY_LOCAL_MACHINE,
+                L"SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+                L"VulnerableDriverBlocklistEnable", &prev, 1);
             if (disable_vulnerable_driver_blocklist()) {
+                s.changed_blocklist = true;
+                s.prev_blocklist = prev;
+                s.valid = true;
+                persist_host_state();
                 printf("[+] Disabled. Reboot required.\n");
                 need_reboot = true;
             } else {
@@ -182,8 +333,16 @@ public:
 
         // -- Memory Integrity (HVCI) --
         if (check_memory_integrity()) {
-            printf("[*] Memory Integrity (HVCI) is enabled. Disabling...\n");
+            printf("[*] Memory Integrity (HVCI) is enabled. Disabling (will restore on exit)...\n");
+            DWORD prev = 1;
+            query_reg_dword(HKEY_LOCAL_MACHINE,
+                L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+                L"Enabled", &prev, 1);
             if (disable_memory_integrity()) {
+                s.changed_hvci = true;
+                s.prev_hvci = prev;
+                s.valid = true;
+                persist_host_state();
                 printf("[+] Disabled. Reboot required.\n");
                 need_reboot = true;
             } else {
@@ -195,6 +354,7 @@ public:
         if (need_reboot) {
             printf("\n[!] Registry changes applied. A REBOOT is required.\n");
             printf("    After reboot, run this program again.\n");
+            printf("    On clean exit we restore the previous values (another reboot applies them).\n");
             printf("\n    Reboot now? (y/n): ");
             char c;
             scanf_s(" %c", &c, 1);
@@ -389,11 +549,18 @@ public:
         return deleted != FALSE;
     }
 
-    static void full_cleanup() {
-        unload_driver();
-        if (!check_driver_loaded()) {
-            printf("[+] Cleanup complete. No driver traces in system.\n");
+    static void full_cleanup(bool scm_loaded = true) {
+        if (scm_loaded) {
+            unload_driver();
+            if (!check_driver_loaded())
+                printf("[+] SCM driver service removed.\n");
+            else
+                printf("[!] Driver service may still be present.\n");
+        } else {
+            printf("[*] kdmapper path: mapped image cannot be unloaded without reboot.\n");
         }
+
+        restore_host_state();
     }
 
 private:

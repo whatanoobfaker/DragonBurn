@@ -13,14 +13,15 @@
 #define DRIVER_DEVICE_NAME    L"\\Device\\dragonburn_driver"
 #define DRIVER_SYMBOLIC_LINK  L"\\DosDevices\\dragonburn_driver"
 
-#define IOCTL_READ_MEMORY     CTL_CODE(0x8000, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_GET_MODULE_BASE CTL_CODE(0x8000, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_PING            CTL_CODE(0x8000, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Require read/write access on the handle — not FILE_ANY_ACCESS. */
+#define IOCTL_READ_MEMORY     CTL_CODE(0x8000, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_GET_MODULE_BASE CTL_CODE(0x8000, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_PING            CTL_CODE(0x8000, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SET_TARGET_PID  CTL_CODE(0x8000, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 #define PING_MAGIC            0xDEADBEEFCAFEBABEULL
 #define MAX_READ_SIZE         0x10000
 
- /* x64 usermode address space limits */
 #define UM_LOW   0x10000ULL
 #define UM_HIGH  0x7FFFFFFFFFFFULL
 
@@ -48,6 +49,19 @@ typedef struct _MODULE_BASE_REQUEST {
 typedef struct _PING_RESPONSE {
     ULONG64 magic;
 } PING_RESPONSE, * PPING_RESPONSE;
+
+typedef struct _SET_TARGET_REQUEST {
+    ULONG target_pid;
+    ULONG padding;
+} SET_TARGET_REQUEST, * PSET_TARGET_REQUEST;
+
+/* =================================================================
+ * Global client binding (single authorized usermode process)
+ * ================================================================= */
+
+static volatile LONG g_client_pid = 0;   /* 0 = unbound */
+static volatile LONG g_target_pid = 0;   /* 0 = no target registered */
+static PDEVICE_OBJECT g_device_object = NULL;
 
 /* =================================================================
  * Undocumented exports
@@ -90,16 +104,59 @@ typedef struct _PEB2 {
 } PEB2, * PPEB2;
 
 /* =================================================================
- * Address validation
+ * Helpers
  * ================================================================= */
 
 static __forceinline BOOLEAN IsValidUserAddress(ULONG64 Address, ULONG Size)
 {
     if (Address < UM_LOW)                   return FALSE;
     if (Address > UM_HIGH)                  return FALSE;
-    if (Address + Size < Address)           return FALSE;  /* overflow */
+    if (Address + Size < Address)           return FALSE;
     if (Address + Size > UM_HIGH)           return FALSE;
     return TRUE;
+}
+
+static BOOLEAN IsProcessAlive(HANDLE Pid)
+{
+    PEPROCESS proc = NULL;
+    NTSTATUS status;
+
+    if (!Pid)
+        return FALSE;
+
+    status = PsLookupProcessByProcessId(Pid, &proc);
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    if (PsGetProcessExitStatus(proc) != STATUS_PENDING) {
+        ObDereferenceObject(proc);
+        return FALSE;
+    }
+
+    ObDereferenceObject(proc);
+    return TRUE;
+}
+
+static BOOLEAN IsAuthorizedCaller(VOID)
+{
+    LONG bound = InterlockedCompareExchange(&g_client_pid, 0, 0);
+    HANDLE caller = PsGetCurrentProcessId();
+
+    if (bound == 0)
+        return FALSE;
+
+    if ((LONG)(ULONG_PTR)caller != bound)
+        return FALSE;
+
+    return TRUE;
+}
+
+static BOOLEAN IsAllowedTarget(ULONG Pid)
+{
+    LONG target = InterlockedCompareExchange(&g_target_pid, 0, 0);
+    if (target == 0)
+        return FALSE;
+    return (LONG)Pid == target;
 }
 
 /* =================================================================
@@ -147,7 +204,7 @@ static NTSTATUS KernelReadProcessMemory(
     ObDereferenceObject(proc);
 
     if (BytesRead) *BytesRead = bytes;
-    return status;
+    return status; /* Propagate real failure — never fake SUCCESS */
 }
 
 /* =================================================================
@@ -231,11 +288,45 @@ static NTSTATUS KernelGetModuleBase(
 
 NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DevObj, PIRP Irp)
 {
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status = STATUS_SUCCESS;
+
     UNREFERENCED_PARAMETER(DevObj);
-    Irp->IoStatus.Status = STATUS_SUCCESS;
+
+    if (stack->MajorFunction == IRP_MJ_CREATE) {
+        HANDLE caller = PsGetCurrentProcessId();
+        LONG bound = InterlockedCompareExchange(&g_client_pid, 0, 0);
+
+        if (bound != 0 && (LONG)(ULONG_PTR)caller != bound) {
+            if (IsProcessAlive((HANDLE)(ULONG_PTR)bound)) {
+                status = STATUS_ACCESS_DENIED;
+                DbgPrint("[MemReader] CREATE denied: bound to pid %ld, caller %p\n",
+                    bound, caller);
+            } else {
+                /* Previous client died — allow rebind */
+                InterlockedExchange(&g_client_pid, (LONG)(ULONG_PTR)caller);
+                InterlockedExchange(&g_target_pid, 0);
+                DbgPrint("[MemReader] Rebound client to pid %p\n", caller);
+            }
+        } else if (bound == 0) {
+            InterlockedExchange(&g_client_pid, (LONG)(ULONG_PTR)caller);
+            InterlockedExchange(&g_target_pid, 0);
+            DbgPrint("[MemReader] Bound client pid %p\n", caller);
+        }
+    } else if (stack->MajorFunction == IRP_MJ_CLOSE) {
+        HANDLE caller = PsGetCurrentProcessId();
+        LONG bound = InterlockedCompareExchange(&g_client_pid, 0, 0);
+        if (bound != 0 && (LONG)(ULONG_PTR)caller == bound) {
+            InterlockedExchange(&g_client_pid, 0);
+            InterlockedExchange(&g_target_pid, 0);
+            DbgPrint("[MemReader] Client pid %p closed — unbound\n", caller);
+        }
+    }
+
+    Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_SUCCESS;
+    return status;
 }
 
 NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
@@ -254,6 +345,11 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
     outLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
     code = stack->Parameters.DeviceIoControl.IoControlCode;
 
+    if (!IsAuthorizedCaller()) {
+        status = STATUS_ACCESS_DENIED;
+        goto complete;
+    }
+
     switch (code) {
 
     case IOCTL_PING:
@@ -264,6 +360,28 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
         }
         ((PPING_RESPONSE)buf)->magic = PING_MAGIC;
         bytesRet = sizeof(PING_RESPONSE);
+        break;
+    }
+
+    case IOCTL_SET_TARGET_PID:
+    {
+        SET_TARGET_REQUEST req;
+
+        if (inLen < sizeof(SET_TARGET_REQUEST)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(&req, buf, sizeof(SET_TARGET_REQUEST));
+
+        if (req.target_pid == 0 || !IsProcessAlive((HANDLE)(ULONG_PTR)req.target_pid)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        InterlockedExchange(&g_target_pid, (LONG)req.target_pid);
+        DbgPrint("[MemReader] Target pid set to %lu\n", req.target_pid);
+        bytesRet = 0;
         break;
     }
 
@@ -287,6 +405,10 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
+        if (!IsAllowedTarget(req.target_pid)) {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
 
         status = KernelReadProcessMemory(
             req.target_pid,
@@ -297,11 +419,13 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
 
         if (NT_SUCCESS(status)) {
             bytesRet = (ULONG)br;
-        }
-        else {
-            RtlZeroMemory(buf, req.read_size);
-            bytesRet = req.read_size;
-            status = STATUS_SUCCESS;
+            /* Partial copy is still a failure for our protocol */
+            if (br != (SIZE_T)req.read_size) {
+                status = STATUS_PARTIAL_COPY;
+                bytesRet = (ULONG)br;
+            }
+        } else {
+            bytesRet = 0;
         }
         break;
     }
@@ -318,6 +442,11 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
             break;
         }
 
+        if (!IsAllowedTarget(((PMODULE_BASE_REQUEST)buf)->target_pid)) {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
         ((PMODULE_BASE_REQUEST)buf)->module_name[255] = L'\0';
 
         status = KernelGetModuleBase(
@@ -330,6 +459,10 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
             ((PMODULE_BASE_REQUEST)buf)->base_address = baseAddr;
             ((PMODULE_BASE_REQUEST)buf)->module_size = modSize;
             bytesRet = sizeof(MODULE_BASE_REQUEST);
+        } else {
+            ((PMODULE_BASE_REQUEST)buf)->base_address = 0;
+            ((PMODULE_BASE_REQUEST)buf)->module_size = 0;
+            bytesRet = 0;
         }
         break;
     }
@@ -339,15 +472,12 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
         break;
     }
 
+complete:
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = bytesRet;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
-
-/* =================================================================
- * Unload
- * ================================================================= */
 
 NTSTATUS UnsupportedDispatch(PDEVICE_OBJECT device_obj, PIRP irp) {
     UNREFERENCED_PARAMETER(device_obj);
@@ -357,11 +487,25 @@ NTSTATUS UnsupportedDispatch(PDEVICE_OBJECT device_obj, PIRP irp) {
     return irp->IoStatus.Status;
 }
 
+static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
+{
+    UNICODE_STRING symLink;
+    RtlInitUnicodeString(&symLink, DRIVER_SYMBOLIC_LINK);
+    IoDeleteSymbolicLink(&symLink);
+
+    if (DriverObject->DeviceObject)
+        IoDeleteDevice(DriverObject->DeviceObject);
+
+    g_device_object = NULL;
+    InterlockedExchange(&g_client_pid, 0);
+    InterlockedExchange(&g_target_pid, 0);
+    DbgPrint("[MemReader] Unloaded\n");
+}
+
 /* =================================================================
  * Entry
  * ================================================================= */
 
- /* Real initialization (called by IoCreateDriver with real driver object) */
 NTSTATUS RealDriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
@@ -375,18 +519,16 @@ NTSTATUS RealDriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
     RtlInitUnicodeString(&devName, DRIVER_DEVICE_NAME);
     RtlInitUnicodeString(&symLink, DRIVER_SYMBOLIC_LINK);
 
-    DbgPrint("[MemReader] Device name: %wZ\n", &devName);
-    DbgPrint("[MemReader] SymLink name: %wZ\n", &symLink);
-
     IoDeleteSymbolicLink(&symLink);
 
+    /* Exclusive=TRUE: only one usermode handle at a time */
     status = IoCreateDevice(
         DriverObject,
         0,
         &devName,
         FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,
-        FALSE,
+        TRUE,
         &devObj
     );
 
@@ -402,7 +544,7 @@ NTSTATUS RealDriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
         return status;
     }
 
-    DbgPrint("[MemReader] Device created at: %p\n", devObj);
+    g_device_object = devObj;
 
     status = IoCreateSymbolicLink(&symLink, &devName);
     DbgPrint("[MemReader] IoCreateSymbolicLink = 0x%08X\n", status);
@@ -410,10 +552,9 @@ NTSTATUS RealDriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
     if (!NT_SUCCESS(status)) {
         DbgPrint("[MemReader] ERROR: SymLink creation failed\n");
         IoDeleteDevice(devObj);
+        g_device_object = NULL;
         return status;
     }
-
-    DbgPrint("[MemReader] Setting up IRP handlers...\n");
 
     devObj->Flags |= DO_BUFFERED_IO;
 
@@ -423,15 +564,19 @@ NTSTATUS RealDriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
     DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
-    DriverObject->DriverUnload = NULL;
+
+    /* SCM loads can unload; kdmapper ignores this but it is correct for service path */
+    DriverObject->DriverUnload = DriverUnload;
+
+    InterlockedExchange(&g_client_pid, 0);
+    InterlockedExchange(&g_target_pid, 0);
 
     devObj->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    DbgPrint("[MemReader] === Driver fully initialized ===\n");
+    DbgPrint("[MemReader] === Driver fully initialized (exclusive + client bind) ===\n");
     return STATUS_SUCCESS;
 }
 
-/* Entry point for kdmapper */
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(DriverObject);

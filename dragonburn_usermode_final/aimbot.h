@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 #include "aimbot_math.h"
@@ -18,6 +19,96 @@ static std::atomic<bool> g_aimbot_running{ false };
 
 static float aim_error_x = 0.0f;
 static float aim_error_y = 0.0f;
+static float rcs_error_x = 0.0f;
+static float rcs_error_y = 0.0f;
+static Vec3  rcs_old_punch{};
+static bool  rcs_punch_init = false;
+
+static bool is_gun_weapon(uint16_t def) {
+    if (def == 0 || def == 31 || def == 42 || def == 49 || def == 59) return false;
+    if (def >= 43 && def <= 48) return false;
+    if (def >= 500) return false;
+    return true;
+}
+
+static AimAngles view_with_punch_removed(const AimbotFrame& frame) {
+    AimAngles a{};
+    a.pitch = frame.view_angles.x;
+    a.yaw   = frame.view_angles.y;
+    if (g_settings.aimbot_rcs_compensate && frame.shots_fired > 0) {
+        const float s = g_settings.rcs_strength;
+        a.pitch -= frame.aim_punch.x * 2.0f * s;
+        a.yaw   -= frame.aim_punch.y * 2.0f * s;
+        a.yaw = normalize_yaw(a.yaw);
+    }
+    return a;
+}
+
+static void rcs_tick() {
+    if (!g_settings.master_switch || !g_settings.rcs_enabled)
+        return;
+
+    AimbotFrame frame = g_aimbot_data.snapshot();
+    if (frame.local_pawn == 0 || frame.screen_w == 0 || !frame.camera_valid)
+        return;
+    if (!is_gun_weapon(frame.local_weapon_def_index)) {
+        rcs_punch_init = false;
+        rcs_error_x = rcs_error_y = 0.f;
+        return;
+    }
+
+    // Aimbot already holds the key — still apply punch delta when shooting
+    const bool aiming = g_settings.aimbot_enabled &&
+                        (GetAsyncKeyState(g_settings.key_aimbot) & 0x8000);
+    // Avoid double-compensation: aimbot already aims through punch
+    if (aiming && g_settings.aimbot_rcs_compensate) {
+        rcs_old_punch = frame.aim_punch;
+        rcs_punch_init = true;
+        return;
+    }
+    if (!g_settings.rcs_standalone && !aiming) {
+        rcs_punch_init = false;
+        return;
+    }
+
+    if (frame.shots_fired < g_settings.rcs_start_bullet) {
+        rcs_old_punch = frame.aim_punch;
+        rcs_punch_init = true;
+        rcs_error_x = rcs_error_y = 0.f;
+        return;
+    }
+
+    if (!rcs_punch_init) {
+        rcs_old_punch = frame.aim_punch;
+        rcs_punch_init = true;
+        return;
+    }
+
+    const float strength = 2.0f * g_settings.rcs_strength;
+    float dp = (frame.aim_punch.x - rcs_old_punch.x) * strength;
+    float dy = (frame.aim_punch.y - rcs_old_punch.y) * strength;
+    rcs_old_punch = frame.aim_punch;
+
+    if (fabsf(dp) < 1e-5f && fabsf(dy) < 1e-5f)
+        return;
+
+    float deg_per_pixel = frame.camera_fov / static_cast<float>(frame.screen_w);
+    if (deg_per_pixel < 1e-6f) return;
+
+    // Compensate punch: counter-yaw left/right, counter-pitch up/down
+    float move_x = -dy / deg_per_pixel;
+    float move_y =  dp / deg_per_pixel;
+
+    rcs_error_x += move_x;
+    rcs_error_y += move_y;
+    int dx = static_cast<int>(rcs_error_x);
+    int dyi = static_cast<int>(rcs_error_y);
+    rcs_error_x -= static_cast<float>(dx);
+    rcs_error_y -= static_cast<float>(dyi);
+
+    if (dx != 0 || dyi != 0)
+        g_input.inject_mouse(dx, dyi, Input::move);
+}
 
 static bool  g_trigger_waiting      = false;
 static bool  g_trigger_held         = false;
@@ -232,10 +323,7 @@ static void aimbot_tick() {
     if (!frame.camera_valid) return;
 
     Vec3 eye_pos = frame.eye_origin;
-
-    AimAngles view_angles{};
-    view_angles.pitch = frame.view_angles.x;
-    view_angles.yaw   = frame.view_angles.y;
+    AimAngles view_angles = view_with_punch_removed(frame);
 
     float deg_per_pixel = frame.camera_fov
                         / static_cast<float>(frame.screen_w);
@@ -247,15 +335,15 @@ static void aimbot_tick() {
         &AimbotFrame::Target::pelvis_pos,
     };
 
-    int bone_count = 1;
-    int bone_start = g_settings.aimbot_bone;
-    auto fov_limit = static_cast<float>(g_settings.aimbot_fov);
+    const int primary = g_settings.aimbot_bone;
+    const bool multipoint = g_settings.aimbot_multipoint;
+    const auto fov_limit = static_cast<float>(g_settings.aimbot_fov);
+    const bool do_vis = g_settings.aimbot_visible_check;
+    const bool bvh_valid = do_vis && g_bvh.valid();
 
-    // ─── Find closest visible target to crosshair ─────
     float best_fov = fov_limit;
     bool  found = false;
     Vec3  best_aim_point{};
-    bool bvh_valid = g_bvh.valid();
 
     for (int i = 1; i < EntityList::MAX_PLAYERS; i++)
     {
@@ -266,14 +354,29 @@ static void aimbot_tick() {
         if (!t.valid || t.health <= 0)  continue;
         if (t.team == frame.local_team) continue;
 
-        if (frame.local_player_index >= 0) {
+        if (do_vis && frame.local_player_index >= 0) {
             if (!(t.bSpottedByMask & (uint64_t(1) << frame.local_player_index)))
                 continue;
         }
 
-        for (int b = bone_start; b < bone_start + bone_count; b++)
+        // Preferred bone first, then nearby multipoints
+        int order[4];
+        int order_n = 0;
+        order[order_n++] = primary;
+        if (multipoint) {
+            for (int b = 0; b < 4; b++) {
+                if (b == primary) continue;
+                order[order_n++] = b;
+            }
+        }
+
+        for (int oi = 0; oi < order_n; oi++)
         {
-            Vec3 bone_pos = t.*(bone_list[b]);
+            Vec3 bone_pos = t.*(bone_list[order[oi]]);
+
+            if (g_settings.aimbot_prediction) {
+                bone_pos = bone_pos + t.velocity * g_settings.aimbot_predict_time;
+            }
 
             AimAngles desired = calculate_angle(eye_pos, bone_pos);
             float fov = get_fov_between(view_angles, desired);
@@ -291,17 +394,24 @@ static void aimbot_tick() {
             best_aim_point = bone_pos;
             found          = true;
 
-            break;
+            if (!multipoint)
+                break;
+            // With multipoint, keep scanning for closer FOV on this player
         }
     }
 
-    // ─── Move mouse ───────────────────────────────────
     if (found)
     {
         AimAngles desired = calculate_angle(eye_pos, best_aim_point);
 
         float delta_pitch = desired.pitch - view_angles.pitch;
         float delta_yaw   = normalize_yaw(desired.yaw - view_angles.yaw);
+
+        if (g_settings.aimbot_humanize) {
+            const float h = g_settings.aimbot_humanize_strength;
+            delta_pitch += ((static_cast<float>(rand() % 2001) / 1000.f) - 1.f) * h * 0.15f;
+            delta_yaw   += ((static_cast<float>(rand() % 2001) / 1000.f) - 1.f) * h * 0.15f;
+        }
 
         if (g_settings.aimbot_smooth > 1.0f)
         {
@@ -322,14 +432,29 @@ static void aimbot_tick() {
         aim_error_y -= static_cast<float>(dy);
 
         if (dx != 0 || dy != 0)
-        {
             g_input.inject_mouse(dx, dy, Input::move);
-        }
     }
     else
     {
         aim_error_x = aim_error_y = 0.0f;
     }
+}
+
+static void draw_aimbot_fov(ImDrawList* draw, int sw, int sh, float camera_fov)
+{
+    if (!draw || !g_settings.master_switch || !g_settings.aimbot_enabled ||
+        !g_settings.aimbot_draw_fov)
+        return;
+    if (camera_fov < 1.f) camera_fov = 90.f;
+
+    const float cx = sw * 0.5f;
+    const float cy = sh * 0.5f;
+    // Approximate FOV circle in screen space
+    float radius = (g_settings.aimbot_fov / camera_fov) * (sw * 0.5f);
+    if (radius < 4.f) radius = 4.f;
+    if (radius > sw) radius = static_cast<float>(sw);
+
+    draw->AddCircle({ cx, cy }, radius, IM_COL32(255, 255, 255, 70), 64, 1.25f);
 }
 
 static void aimbot_thread_func()
@@ -344,6 +469,7 @@ static void aimbot_thread_func()
 
         if (g_overlay.is_game_window()) {
             triggerbot_tick();
+            rcs_tick();
             aimbot_tick();
         }
 

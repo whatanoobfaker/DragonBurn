@@ -6,6 +6,7 @@ built/
 [Rr]elease/
 *.exe
 *.dll
+*.sys
 *.pdb
 *.ilk
 *.exp
@@ -37,6 +38,12 @@ cache/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Host mutation restore state (local machine only)
+dragonburn_host_state.txt
+dragonburn_mapper_host_state.txt
+**/dragonburn_host_state.txt
+**/dragonburn_mapper_host_state.txt
 
 # IDE
 *.swp

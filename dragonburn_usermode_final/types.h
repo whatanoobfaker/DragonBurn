@@ -114,6 +114,7 @@ struct PlayerVisuals {
     Vec3 neck_world{};      // bone 5
     Vec3 chest_world{};     // bone 4
     Vec3 pelvis_world{};    // bone 0
+    Vec3 velocity{};
     bool is_scoped = false;
     bool has_c4 = false;
     uint64_t bSpottedByMask = 0;

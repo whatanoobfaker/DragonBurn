@@ -3,7 +3,7 @@
 static constexpr float REFERENCE_HEIGHT = 1080.0f;
 
 struct MenuSettings {
-    int memory_backend = -1;
+    int memory_backend = 3; // 1=WinApi, 2=Syscall, 3=KernelDriver (default)
 
     bool master_switch = true;
     bool esp_enabled = true;
@@ -106,7 +106,7 @@ struct MenuSettings {
     float spec_y = 30.0f;
 
     // Grenade Helper
-    bool  grenade_helper_enabled    = false;
+    bool  grenade_helper_enabled    = true;
     bool  grenade_helper_visible    = true;
     int   key_grenade_toggle        = VK_F3;
     int   key_grenade_add           = VK_F4;
@@ -125,17 +125,45 @@ struct MenuSettings {
 
     // Aimbot
     bool aimbot_enabled = false;
-    int key_aimbot = 'X';
+    int key_aimbot = 0x06; // VK_XBUTTON2 (Mouse 5) — distinct from trigger
     float aimbot_fov = 5.f;
     float aimbot_smooth = 1.0f;
     int  aimbot_bone = 0; // 0=Head,1=Neck,2=Chest,3=Pelvis
+    bool aimbot_multipoint = true;       // also try nearby bones
+    bool aimbot_visible_check = true;    // BVH / spotted gate
+    bool aimbot_draw_fov = true;
+    bool aimbot_prediction = true;       // simple velocity lead
+    float aimbot_predict_time = 0.12f;   // seconds of lead
+    bool aimbot_humanize = false;
+    float aimbot_humanize_strength = 0.35f; // degrees of jitter scale
+    bool aimbot_rcs_compensate = true;   // subtract punch while aiming
+
+    // Recoil control (standalone RCS)
+    bool  rcs_enabled = false;
+    float rcs_strength = 1.0f;           // 0..2 (1 = classic 2x punch scale handled internally)
+    int   rcs_start_bullet = 1;          // start compensating after N shots fired
+    bool  rcs_standalone = true;         // run even when aimbot key is up
 
     // Trigger
     bool  triggerbot_enabled = false;
     bool  triggerbot_always_on = false;
     bool  triggerbot_scoped_only = false;
-    int   key_triggerbot     = 'X';
+    int   key_triggerbot     = 0x05; // VK_XBUTTON1 (Mouse 4)
     float triggerbot_delay = 50.f;
+
+    // World / projectile ESP
+    bool  world_esp_enabled = true;
+    bool  world_esp_projectiles = true;
+    bool  world_esp_trails = true;
+    bool  world_esp_smoke = true;
+    bool  world_esp_inferno = true;
+    bool  world_esp_labels = true;
+    float world_esp_max_dist = 3500.f;
+    float world_esp_trail_color[4] = {1.f, 0.85f, 0.2f, 0.9f};
+    float world_esp_smoke_color[4] = {0.7f, 0.7f, 0.75f, 0.85f};
+    float world_esp_molotov_color[4] = {1.f, 0.35f, 0.1f, 0.9f};
+    float world_esp_flash_color[4] = {0.95f, 0.95f, 0.4f, 0.9f};
+    float world_esp_he_color[4] = {1.f, 0.45f, 0.15f, 0.9f};
 
 
     // Crosshair

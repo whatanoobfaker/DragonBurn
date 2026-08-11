@@ -27,10 +27,25 @@ public:
         ImGuiIO& io = ImGui::GetIO();
         const float win_w = layout::window_w;
         const float win_h = layout::window_h;
-        const ImVec2 win_pos((io.DisplaySize.x - win_w) * 0.5f, (io.DisplaySize.y - win_h) * 0.5f);
 
-        ImGui::SetNextWindowPos(win_pos, ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize({win_w, win_h}, ImGuiCond_FirstUseEver);
+        static bool placed = false;
+        if (!placed) {
+            ImVec2 win_pos;
+            if (g_settings.menu_x >= 0.f && g_settings.menu_y >= 0.f) {
+                win_pos = {
+                    ImClamp(g_settings.menu_x, 0.f, ImMax(0.f, io.DisplaySize.x - win_w)),
+                    ImClamp(g_settings.menu_y, 0.f, ImMax(0.f, io.DisplaySize.y - win_h))
+                };
+            } else {
+                win_pos = {
+                    (io.DisplaySize.x - win_w) * 0.5f,
+                    (io.DisplaySize.y - win_h) * 0.5f
+                };
+            }
+            ImGui::SetNextWindowPos(win_pos, ImGuiCond_Always);
+            placed = true;
+        }
+        ImGui::SetNextWindowSize({win_w, win_h}, ImGuiCond_Always);
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
@@ -45,6 +60,8 @@ public:
         ImGui::PopStyleVar(3);
 
         const ImVec2 origin = ImGui::GetWindowPos();
+        g_settings.menu_x = origin.x;
+        g_settings.menu_y = origin.y;
         const ImRect window_rect(origin, origin + ImVec2(win_w, win_h));
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -125,7 +142,12 @@ private:
     }
 
     void render_aimbot_panel(float cw) {
-        int rows = 1 + (g_settings.aimbot_enabled ? 4 : 0);
+        int rows = 1;
+        if (g_settings.aimbot_enabled) {
+            rows += 10; // key,fov,smooth,bone,multi,vis,drawfov,pred,human,rcscomp
+            if (g_settings.aimbot_prediction) rows += 1;
+            if (g_settings.aimbot_humanize) rows += 1;
+        }
         if (!widgets::begin_panel("Aimbot", cw, rows)) return;
         widgets::checkbox("Enable", &g_settings.aimbot_enabled);
         if (g_settings.aimbot_enabled) {
@@ -134,6 +156,16 @@ private:
             widgets::slider_float("Smoothness", &g_settings.aimbot_smooth, 1.f, 20.f, "%.0f", true);
             const char* bones[] = { "Head", "Neck", "Chest", "Pelvis" };
             widgets::combo("Bone", &g_settings.aimbot_bone, bones, 4);
+            widgets::checkbox("Multipoint", &g_settings.aimbot_multipoint);
+            widgets::checkbox("Visibility Check", &g_settings.aimbot_visible_check);
+            widgets::checkbox("Draw FOV", &g_settings.aimbot_draw_fov);
+            widgets::checkbox("Velocity Prediction", &g_settings.aimbot_prediction);
+            if (g_settings.aimbot_prediction)
+                widgets::slider_float("Predict Time", &g_settings.aimbot_predict_time, 0.02f, 0.35f, "%.2f");
+            widgets::checkbox("Humanize", &g_settings.aimbot_humanize);
+            if (g_settings.aimbot_humanize)
+                widgets::slider_float("Humanize Amt", &g_settings.aimbot_humanize_strength, 0.05f, 1.5f, "%.2f");
+            widgets::checkbox("RCS Compensate", &g_settings.aimbot_rcs_compensate);
         }
         widgets::end_panel();
     }
@@ -152,12 +184,16 @@ private:
     }
 
     void render_recoil_panel(float cw) {
-        if (!widgets::begin_panel("Recoil Control", cw, 1)) return;
-        if (ImFont* f = fonts::regular()) {
-            const ImVec2 pos = ImGui::GetCursorScreenPos();
-            ImGui::GetWindowDrawList()->AddText(f, 15.f,
-                { pos.x, pos.y + 8.f },
-                ImGui::GetColorU32(colors::TextMuted), "Coming soon");
+        int rows = 1 + (g_settings.rcs_enabled ? 3 : 0);
+        if (!widgets::begin_panel("Recoil Control", cw, rows)) return;
+        widgets::checkbox("Enable RCS", &g_settings.rcs_enabled);
+        if (g_settings.rcs_enabled) {
+            widgets::slider_float("Strength", &g_settings.rcs_strength, 0.1f, 2.0f, "%.2f");
+            float start_b = static_cast<float>(g_settings.rcs_start_bullet);
+            widgets::slider_float("Start Bullet", &start_b, 1.f, 6.f, "%.0f");
+            g_settings.rcs_start_bullet = static_cast<int>(start_b + 0.5f);
+            if (g_settings.rcs_start_bullet < 1) g_settings.rcs_start_bullet = 1;
+            widgets::checkbox("Standalone (no aim key)", &g_settings.rcs_standalone, true);
         }
         widgets::end_panel();
     }
@@ -455,7 +491,7 @@ private:
         };
 
         auto panel_nades = [&]() {
-            if (!widgets::begin_panel("Grenade Helper", col_w, 8)) return;
+            if (!widgets::begin_panel("Grenade Lineups", col_w, 9)) return;
             widgets::checkbox("Enabled##nades", &g_settings.grenade_helper_enabled);
             widgets::combo("Filter", &m_filter_idx, nade_filter_items, IM_ARRAYSIZE(nade_filter_items));
             update_nade_filter();
@@ -465,6 +501,26 @@ private:
             ImGui::ColorEdit4("Text##ntc", g_settings.grenade_text_color, ImGuiColorEditFlags_NoInputs);
             widgets::slider_float("Circle Radius", &g_settings.grenade_circle_radius, 10, 150, "%.0f");
             widgets::slider_float("Circle Thick.", &g_settings.grenade_circle_thickness, 0.5f, 4.f, "%.1f");
+            widgets::end_panel();
+        };
+
+        auto panel_world = [&]() {
+            int rows = 1;
+            if (g_settings.world_esp_enabled) rows += 10;
+            if (!widgets::begin_panel("World ESP", col_w, rows)) return;
+            widgets::checkbox("Enabled##world", &g_settings.world_esp_enabled);
+            if (g_settings.world_esp_enabled) {
+                widgets::checkbox("Projectiles", &g_settings.world_esp_projectiles);
+                widgets::checkbox("Trails", &g_settings.world_esp_trails);
+                widgets::checkbox("Smoke Clouds", &g_settings.world_esp_smoke);
+                widgets::checkbox("Molotov / Inferno", &g_settings.world_esp_inferno);
+                widgets::checkbox("Labels", &g_settings.world_esp_labels);
+                widgets::slider_float("Max Distance", &g_settings.world_esp_max_dist, 500.f, 8000.f, "%.0f");
+                ImGui::ColorEdit4("Trail##wtc", g_settings.world_esp_trail_color, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Smoke##wsc", g_settings.world_esp_smoke_color, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("Molly##wmc", g_settings.world_esp_molotov_color, ImGuiColorEditFlags_NoInputs);
+                ImGui::ColorEdit4("HE##whe", g_settings.world_esp_he_color, ImGuiColorEditFlags_NoInputs);
+            }
             widgets::end_panel();
         };
 
@@ -478,6 +534,8 @@ private:
 
         ImGui::BeginGroup();
         panel_nades();
+        ImGui::Dummy({0.f, layout::panel_gap});
+        panel_world();
         ImGui::EndGroup();
     }
 
@@ -492,18 +550,30 @@ private:
 
     void render_settings(float col_w) {
         auto panel_general = [&]() {
-            if (!widgets::begin_panel("General", col_w, 4)) return;
+            if (!widgets::begin_panel("General", col_w, 5)) return;
             widgets::checkbox("Master Switch", &g_settings.master_switch);
             widgets::checkbox("Vsync", &g_settings.use_vsync);
             widgets::slider_float("Target FPS", &g_settings.target_fps, 30, 144, "%.0f");
-            widgets::slider_float("Background Alpha", &g_settings.menu_bg_alpha, 0.3f, 1.f, "%.2f", true);
+            widgets::slider_float("Background Alpha", &g_settings.menu_bg_alpha, 0.3f, 1.f, "%.2f");
+            {
+                // 0-based combo index mapped to backend enum 1..3
+                static const char* backends[] = { "WinAPI", "Syscall", "Kernel Driver" };
+                int backend_idx = g_settings.memory_backend;
+                if (backend_idx < 1 || backend_idx > 3) backend_idx = 3;
+                backend_idx -= 1;
+                widgets::combo("Memory Backend", &backend_idx, backends, 3, true);
+                g_settings.memory_backend = backend_idx + 1;
+            }
             widgets::end_panel();
         };
 
         auto panel_keybinds = [&]() {
-            if (!widgets::begin_panel("Key Binds", col_w, 3)) return;
+            if (!widgets::begin_panel("Key Binds", col_w, 6)) return;
             render_key_bind("Menu Toggle", g_settings.key_menu, bind_waiting_menu);
             render_key_bind("Master Toggle", g_settings.key_master, bind_waiting_master);
+            render_key_bind("Lineup Toggle", g_settings.key_grenade_toggle, bind_waiting_nade_toggle);
+            render_key_bind("Add Lineup", g_settings.key_grenade_add, bind_waiting_nade_add);
+            render_key_bind("Delete Lineup", g_settings.key_grenade_delete, bind_waiting_nade_del);
             render_key_bind("Exit", g_settings.key_exit, bind_waiting_exit, true);
             widgets::end_panel();
         };
@@ -556,6 +626,9 @@ private:
     bool bind_waiting_menu = false;
     bool bind_waiting_master = false;
     bool bind_waiting_exit = false;
+    bool bind_waiting_nade_toggle = false;
+    bool bind_waiting_nade_add = false;
+    bool bind_waiting_nade_del = false;
 
     void render_key_bind(const char* label, int& key, bool& waiting, bool last_element = false) {
         (void)last_element;
